@@ -23,6 +23,7 @@ logger.emit('info', 'relay.config', {
   quotaGlobalMB: config.quotaGlobalBytes / (1024 * 1024),
   ownerTtlDays: config.ownerTtlDays,
   logLevel: config.logLevel,
+  adminAuth: config.adminToken ? 'token' : 'open',
 });
 
 // ─── Data directory ────────────────────────────────────
@@ -53,7 +54,10 @@ const relay = await createNodeJsRelay({
 })({
   port: config.relayPort,
   name: SimpleName.orThrow(config.relayName),
-  enableLogging: true, // Always true — our Console filters by level
+  // When enableEvoluLogging is true, Evolu sets console.enabled = true after startup.
+  // Our custom Console always has enabled=true and filters by LOG_LEVEL,
+  // but Evolu's logger toggles it. Pass through the user's preference.
+  enableLogging: config.enableEvoluLogging,
   isOwnerAllowed: ownerTracker.isOwnerAllowed,
   isOwnerWithinQuota,
 });
@@ -69,7 +73,7 @@ await admin.start();
 
 logger.emit('info', 'relay.ready', {
   relay: `ws://0.0.0.0:${config.relayPort}`,
-  admin: `http://0.0.0.0:${config.adminPort}`,
+  admin: `http://127.0.0.1:${config.adminPort}`,
 });
 
 // ─── Graceful shutdown ────────────────────────────────
@@ -80,9 +84,9 @@ async function shutdown(signal) {
   isShuttingDown = true;
   logger.emit('info', 'relay.shutting_down', { signal });
 
-  ownerTracker.persist();
+  ownerTracker.stop();
   metrics.close();
-  relay.value[Symbol.dispose]();
+  try { relay.value[Symbol.dispose](); } catch {}
   await admin.stop();
 
   logger.emit('info', 'relay.stopped', {});

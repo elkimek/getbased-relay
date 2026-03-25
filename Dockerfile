@@ -8,7 +8,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 COPY . .
 
-RUN mkdir -p /data
+RUN mkdir -p /data && chown node:node /data
 ENV DATA_DIR=/data
 ENV NODE_ENV=production
 
