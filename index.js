@@ -46,6 +46,9 @@ const ownerTracker = createOwnerTracker(config, logger);
 // ─── Quota checker ────────────────────────────────────
 const isOwnerWithinQuota = createQuotaChecker(config, logger, metrics);
 
+// Wire owner tracking through logger subscribe events
+logger.setOwnerCallback((ownerId) => ownerTracker.isOwnerAllowed(ownerId));
+
 // ─── Evolu relay ──────────────────────────────────────
 const { SimpleName } = await import('@evolu/common');
 
@@ -58,7 +61,9 @@ const relay = await createNodeJsRelay({
   // Our custom Console always has enabled=true and filters by LOG_LEVEL,
   // but Evolu's logger toggles it. Pass through the user's preference.
   enableLogging: config.enableEvoluLogging,
-  isOwnerAllowed: ownerTracker.isOwnerAllowed,
+  // Note: providing isOwnerAllowed activates ownerId URL parsing in Evolu,
+  // which rejects connections without an ownerId (including health check probes).
+  // We track owners via subscribe events in the logger instead.
   isOwnerWithinQuota,
 });
 
