@@ -1,21 +1,22 @@
 // getbased-relay — Self-hosted Evolu CRDT relay
 // Wraps @evolu/nodejs with structured logging, metrics, and quota management
 
-import { mkdirSync } from 'fs';
-import { createNodeJsRelay } from '@evolu/nodejs';
-import { loadConfig } from './lib/config.js';
-import { createLogger } from './lib/logger.js';
-import { createQuotaChecker } from './lib/quota.js';
-import { createOwnerTracker } from './lib/owner-tracker.js';
-import { createMetrics } from './lib/metrics.js';
-import { createAdminServer } from './lib/admin-server.js';
-import { runStartupChecks } from './lib/startup-check.js';
+import { mkdirSync } from "fs";
+import { createNodeJsRelay } from "@evolu/nodejs";
+import { SimpleName } from "@evolu/common";
+import { loadConfig } from "./lib/config.js";
+import { createLogger } from "./lib/logger.js";
+import { createQuotaChecker } from "./lib/quota.js";
+import { createOwnerTracker } from "./lib/owner-tracker.js";
+import { createMetrics } from "./lib/metrics.js";
+import { createAdminServer } from "./lib/admin-server.js";
+import { runStartupChecks } from "./lib/startup-check.js";
 
 // ─── Config ────────────────────────────────────────────
 const config = loadConfig();
 const logger = createLogger(config);
 
-logger.emit('info', 'relay.config', {
+logger.emit("info", "relay.config", {
   relayPort: config.relayPort,
   adminPort: config.adminPort,
   dataDir: config.dataDir,
@@ -23,7 +24,7 @@ logger.emit('info', 'relay.config', {
   quotaGlobalMB: config.quotaGlobalBytes / (1024 * 1024),
   ownerTtlDays: config.ownerTtlDays,
   logLevel: config.logLevel,
-  adminAuth: config.adminToken ? 'token' : 'open',
+  adminAuth: config.adminToken ? "token" : "open",
 });
 
 // ─── Data directory ────────────────────────────────────
@@ -33,7 +34,7 @@ process.chdir(config.dataDir);
 // ─── Startup checks ───────────────────────────────────
 const check = runStartupChecks(config, logger);
 if (!check.ok) {
-  logger.emit('error', 'relay.startup_failed', { error: check.error });
+  logger.emit("error", "relay.startup_failed", { error: check.error });
   process.exit(1);
 }
 
@@ -47,28 +48,22 @@ const ownerTracker = createOwnerTracker(config, logger);
 const isOwnerWithinQuota = createQuotaChecker(config, logger, metrics);
 
 // Wire owner tracking through logger subscribe events
-logger.setOwnerCallback((ownerId) => ownerTracker.isOwnerAllowed(ownerId));
+logger.setOwnerCallback((ownerId: string) =>
+  ownerTracker.isOwnerAllowed(ownerId),
+);
 
 // ─── Evolu relay ──────────────────────────────────────
-const { SimpleName } = await import('@evolu/common');
-
 const relay = await createNodeJsRelay({
-  console: logger.console,
+  console: logger.console as never,
 })({
   port: config.relayPort,
   name: SimpleName.orThrow(config.relayName),
-  // When enableEvoluLogging is true, Evolu sets console.enabled = true after startup.
-  // Our custom Console always has enabled=true and filters by LOG_LEVEL,
-  // but Evolu's logger toggles it. Pass through the user's preference.
   enableLogging: config.enableEvoluLogging,
-  // Note: providing isOwnerAllowed activates ownerId URL parsing in Evolu,
-  // which rejects connections without an ownerId (including health check probes).
-  // We track owners via subscribe events in the logger instead.
   isOwnerWithinQuota,
 });
 
 if (!relay.ok) {
-  logger.emit('error', 'relay.failed', { error: relay.error });
+  logger.emit("error", "relay.failed", { error: relay.error as unknown as Record<string, unknown> });
   process.exit(1);
 }
 
@@ -76,7 +71,7 @@ if (!relay.ok) {
 const admin = createAdminServer(config, logger, metrics, ownerTracker);
 await admin.start();
 
-logger.emit('info', 'relay.ready', {
+logger.emit("info", "relay.ready", {
   relay: `ws://0.0.0.0:${config.relayPort}`,
   admin: `http://127.0.0.1:${config.adminPort}`,
 });
@@ -84,19 +79,21 @@ logger.emit('info', 'relay.ready', {
 // ─── Graceful shutdown ────────────────────────────────
 let isShuttingDown = false;
 
-async function shutdown(signal) {
+async function shutdown(signal: string): Promise<void> {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  logger.emit('info', 'relay.shutting_down', { signal });
+  logger.emit("info", "relay.shutting_down", { signal });
 
   ownerTracker.stop();
   metrics.close();
-  try { relay.value[Symbol.dispose](); } catch {}
+  try {
+    if ("value" in relay) relay.value[Symbol.dispose]();
+  } catch {}
   await admin.stop();
 
-  logger.emit('info', 'relay.stopped', {});
+  logger.emit("info", "relay.stopped");
   process.exit(0);
 }
 
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
