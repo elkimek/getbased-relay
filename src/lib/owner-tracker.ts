@@ -7,7 +7,7 @@ const MAX_TRACKED_OWNERS = 10_000;
 const PERSIST_INTERVAL_MS = 5 * 60_000;
 
 export interface OwnerTracker {
-  isOwnerAllowed: (ownerId: string) => boolean;
+  trackOwner: (ownerId: string) => boolean;
   persist: () => void;
   stop: () => void;
   getStaleOwners: () => Array<{ ownerId: string; lastSeen: string }>;
@@ -48,7 +48,7 @@ export function createOwnerTracker(
   const persistTimer = setInterval(persist, PERSIST_INTERVAL_MS);
   persistTimer.unref();
 
-  function isOwnerAllowed(ownerId: string): boolean {
+  function trackOwner(ownerId: string): boolean {
     if (lastSeen.size >= MAX_TRACKED_OWNERS && !lastSeen.has(ownerId)) {
       const oldest = lastSeen.keys().next().value;
       if (oldest) lastSeen.delete(oldest);
@@ -77,5 +77,5 @@ export function createOwnerTracker(
     persist();
   }
 
-  return { isOwnerAllowed, persist, stop, getStaleOwners, getActivity };
+  return { trackOwner, persist, stop, getStaleOwners, getActivity };
 }

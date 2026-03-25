@@ -8,8 +8,8 @@ export interface RelayConfig {
   quotaPerOwnerBytes: number;
   quotaGlobalBytes: number;
   ownerTtlDays: number;
-  logLevel: string;
-  logFormat: string;
+  logLevel: "debug" | "info" | "warn" | "error";
+  logFormat: "json" | "text";
   enableEvoluLogging: boolean;
   adminToken: string | null;
 }
@@ -42,8 +42,8 @@ export function loadConfig(): RelayConfig {
     quotaPerOwnerBytes: envInt("QUOTA_PER_OWNER_MB", 10) * 1024 * 1024,
     quotaGlobalBytes: envInt("QUOTA_GLOBAL_MB", 1000) * 1024 * 1024,
     ownerTtlDays: envInt("OWNER_TTL_DAYS", 90),
-    logLevel: envStr("LOG_LEVEL", "info"),
-    logFormat: envStr("LOG_FORMAT", "json"),
+    logLevel: envStr("LOG_LEVEL", "info") as RelayConfig["logLevel"],
+    logFormat: envStr("LOG_FORMAT", "json") as RelayConfig["logFormat"],
     enableEvoluLogging: envBool("ENABLE_EVOLU_LOGGING", false),
     adminToken: process.env.ADMIN_TOKEN || null,
   };

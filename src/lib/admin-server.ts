@@ -3,6 +3,7 @@
 // /metrics — requires ADMIN_TOKEN if set, returns per-owner usage
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
+import { timingSafeEqual } from "crypto";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -26,7 +27,10 @@ export function createAdminServer(
 
   function checkAuth(req: IncomingMessage): boolean {
     if (!config.adminToken) return true;
-    return req.headers.authorization === `Bearer ${config.adminToken}`;
+    const provided = req.headers.authorization ?? "";
+    const expected = `Bearer ${config.adminToken}`;
+    if (provided.length !== expected.length) return false;
+    return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
   }
 
   function handleHealth(_req: IncomingMessage, res: ServerResponse): void {

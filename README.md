@@ -42,11 +42,12 @@ docker compose up -d
 
 ### Node.js
 
-Requires Node.js >= 22.
+Requires Node.js >= 22 and TypeScript.
 
 ```bash
 npm install
-node index.js
+npm run build
+npm start
 ```
 
 ## Configuration
@@ -104,14 +105,14 @@ The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxie
                           └─────────────────────────┘
 ```
 
-- **index.js** — Entry point, wiring, signal handlers
-- **lib/config.js** — Env var parsing with defaults
-- **lib/logger.js** — Custom Console that intercepts Evolu's 17 relay events, emits structured JSON at configurable levels
-- **lib/quota.js** — Per-owner + global disk quota via `isOwnerWithinQuota` callback
-- **lib/owner-tracker.js** — Last-seen tracking via relay subscribe events, persisted to sidecar file
-- **lib/metrics.js** — Read-only SQLite queries against the relay DB
-- **lib/admin-server.js** — HTTP server for `/health` and `/metrics`
-- **lib/startup-check.js** — DB integrity validation on boot (magic bytes, PRAGMA check, table audit)
+- **src/index.ts** — Entry point, wiring, signal handlers
+- **src/lib/config.ts** — Env var parsing with defaults and typed `RelayConfig` interface
+- **src/lib/logger.ts** — Custom Console that intercepts Evolu's 17 relay events, emits structured JSON at configurable levels
+- **src/lib/quota.ts** — Per-owner + global disk quota via `isOwnerWithinQuota` callback
+- **src/lib/owner-tracker.ts** — Last-seen tracking via relay subscribe events, persisted to sidecar file
+- **src/lib/metrics.ts** — Read-only SQLite queries against the relay DB
+- **src/lib/admin-server.ts** — HTTP server for `/health` and `/metrics`, timing-safe token auth
+- **src/lib/startup-check.ts** — DB integrity validation on boot (magic bytes, PRAGMA check, table audit)
 
 ## Credits
 

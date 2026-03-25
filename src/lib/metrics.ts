@@ -62,8 +62,9 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
   }
 
   function ownerIdToHex(ownerId: unknown): string {
+    if (!ownerId) return "<unknown>";
     if (typeof ownerId === "string") return ownerId;
-    return Buffer.from(ownerId as Buffer).toString("hex");
+    return Buffer.from(ownerId as Uint8Array).toString("hex");
   }
 
   function getOwnerCount(): number {

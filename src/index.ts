@@ -49,10 +49,12 @@ const isOwnerWithinQuota = createQuotaChecker(config, logger, metrics);
 
 // Wire owner tracking through logger subscribe events
 logger.setOwnerCallback((ownerId: string) =>
-  ownerTracker.isOwnerAllowed(ownerId),
+  ownerTracker.trackOwner(ownerId),
 );
 
 // ─── Evolu relay ──────────────────────────────────────
+// Evolu's Console type is not publicly exported — cast required.
+// Our console implements the full interface (log/warn/error/debug + enabled property).
 const relay = await createNodeJsRelay({
   console: logger.console as never,
 })({
@@ -88,7 +90,9 @@ async function shutdown(signal: string): Promise<void> {
   metrics.close();
   try {
     if ("value" in relay) relay.value[Symbol.dispose]();
-  } catch {}
+  } catch (e) {
+    logger.emit("warn", "relay.dispose_error", { error: (e as Error).message });
+  }
   await admin.stop();
 
   logger.emit("info", "relay.stopped");
