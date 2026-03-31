@@ -114,6 +114,37 @@ The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxie
 - **src/lib/admin-server.ts** — HTTP server for `/health` and `/metrics`, timing-safe token auth
 - **src/lib/startup-check.ts** — DB integrity validation on boot (magic bytes, PRAGMA check, table audit)
 
+## Context Gateway
+
+A simple HTTP API that stores per-profile lab context behind token auth. MCP servers and bot plugins use it to query health data on behalf of messenger/bot interfaces. Runs alongside the Evolu relay as a separate service.
+
+### How it works
+
+Each authenticated token gets a JSON file in `/opt/context-gateway/data/` (filename is a hash of the token). Context is stored per-profile, so multiple profiles can coexist under the same token. The format is backward-compatible with the old single-context layout — existing files are migrated on first write.
+
+### Endpoints
+
+All endpoints require `Authorization: Bearer <token>`.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST /api/context` | — | Push context. Body: `{ context, profileId, profiles }` |
+| `GET /api/context` | — | Get the default profile's context |
+| `GET /api/context?profile=<id>` | — | Get a specific profile's context |
+
+### Docker Compose
+
+The `docker-compose.yml` runs both services:
+
+| Service | Port | Purpose |
+|---|---|---|
+| Evolu relay | `:4000` | CRDT sync (WebSocket) |
+| Context gateway | `:4001` | Lab context API (HTTP) |
+
+```bash
+docker compose up -d
+```
+
 ## Credits
 
 Built on [Evolu](https://github.com/evoluhq/evolu) by [Daniel Steigerwald](https://github.com/steida). All sync protocol, CRDT logic, and SQLite storage are from Evolu — this project only adds the operational wrapper.
