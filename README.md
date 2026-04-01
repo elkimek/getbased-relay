@@ -151,4 +151,4 @@ Built on [Evolu](https://github.com/evoluhq/evolu) by [Daniel Steigerwald](https
 
 ## License
 
-MIT
+GPL-3.0
