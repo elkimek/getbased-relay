@@ -39,6 +39,16 @@ export function createAdminServer(
     return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
   }
 
+  // Stricter auth for mutating routes: ALWAYS require a configured ADMIN_TOKEN.
+  // The default-allow behavior of checkAuth() is acceptable for read-only
+  // /metrics on a localhost-bound port, but a destructive endpoint deployed
+  // without a token would let any colocated process or a misconfigured
+  // reverse proxy wipe an owner's CRDT log.
+  function checkAuthStrict(req: IncomingMessage): boolean {
+    if (!config.adminToken) return false;
+    return checkAuth(req);
+  }
+
   function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
@@ -90,33 +100,40 @@ export function createAdminServer(
     let db: Database.Database | null = null;
     try {
       db = new Database(dbPath, { fileMustExist: true });
-      const before = db
-        .prepare(
-          'SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?',
-        )
-        .get(ownerId) as { storedBytes: number } | undefined;
-      const msgCount = db
-        .prepare(
-          'SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?',
-        )
-        .get(ownerId) as { c: number };
+      // Wait up to 30s for the relay's own writer to release the WAL lock
+      // before failing. better-sqlite3 defaults to a 5s busy_timeout, which
+      // is too short for a busy relay where the writer holds the lock during
+      // a large batch ingest.
+      db.pragma("busy_timeout = 30000");
+      // Run the SELECTs inside the same transaction so the deletedMessages
+      // count + before/after storedBytes are consistent with the DELETE/UPDATE
+      // — without this, a concurrent push between the SELECT and the write
+      // would yield a slightly stale count in the response.
+      let before: { storedBytes: number } | undefined;
+      let after: { storedBytes: number } | undefined;
+      let deletedMessages = 0;
       const tx = db.transaction(() => {
+        before = db!
+          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
+          .get(ownerId) as { storedBytes: number } | undefined;
+        const cnt = db!
+          .prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?')
+          .get(ownerId) as { c: number };
+        deletedMessages = cnt.c;
         db!
           .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
           .run(ownerId);
         db!
           .prepare('UPDATE evolu_usage SET "storedBytes" = 0 WHERE "ownerId" = ?')
           .run(ownerId);
+        after = db!
+          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
+          .get(ownerId) as { storedBytes: number } | undefined;
       });
       tx();
-      const after = db
-        .prepare(
-          'SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?',
-        )
-        .get(ownerId) as { storedBytes: number } | undefined;
       logger.emit("info", "admin.compact_owner", {
         ownerId: ownerIdStr,
-        deletedMessages: msgCount.c,
+        deletedMessages,
         beforeStoredBytes: before?.storedBytes ?? 0,
         afterStoredBytes: after?.storedBytes ?? 0,
       });
@@ -125,7 +142,7 @@ export function createAdminServer(
         JSON.stringify(
           {
             ownerId: ownerIdStr,
-            deletedMessages: msgCount.c,
+            deletedMessages,
             beforeStoredBytes: before?.storedBytes ?? 0,
             afterStoredBytes: after?.storedBytes ?? 0,
           },
@@ -138,8 +155,10 @@ export function createAdminServer(
         ownerId: ownerIdStr,
         error: (e as Error).message,
       });
+      // Don't leak the raw error message (which can include the DB filesystem
+      // path) over the wire — keep the detail in the structured log only.
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: (e as Error).message }));
+      res.end(JSON.stringify({ error: "compact_failed" }));
     } finally {
       try {
         db?.close();
@@ -200,6 +219,19 @@ export function createAdminServer(
     }
 
     if (req.method === "POST" && url.pathname === "/compact-owner") {
+      // Stricter check: destructive endpoint must NOT default-allow when
+      // ADMIN_TOKEN is unset. checkAuth above would have already passed in
+      // that mode, so re-gate here.
+      if (!checkAuthStrict(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error:
+              "ADMIN_TOKEN must be configured to use this endpoint",
+          }),
+        );
+        return;
+      }
       return handleCompactOwner(req, res, url);
     }
 
