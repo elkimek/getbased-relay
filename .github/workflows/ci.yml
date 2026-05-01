@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check + build
+        run: npm run build
+
+      - name: Verify dist/ output
+        # Sanity: tsc should emit at least the entrypoint. Catches a silent
+        # `noEmit: true` or missing-file regression that wouldn't fail tsc.
+        run: |
+          test -f dist/index.js || (echo "dist/index.js missing"; exit 1)
+          test -f dist/lib/admin-server.js || (echo "dist/lib/admin-server.js missing"; exit 1)
+
+  docker-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        # Just verifies the Dockerfile still produces a valid image.
+        # Doesn't push anywhere — production deploy is operator-managed.
+        run: docker build -t getbased-relay:ci .
