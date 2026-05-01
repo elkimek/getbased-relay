@@ -1,12 +1,18 @@
 // Health and metrics HTTP endpoints on a separate port.
 // /health — unauthenticated, for uptime monitors
 // /metrics — requires ADMIN_TOKEN if set, returns per-owner usage
+// /compact-owner — requires ADMIN_TOKEN, drops an owner's evolu_message log
+//                  and zeroes their evolu_usage.storedBytes counter so writes
+//                  resume after the per-owner quota is hit. Clients keep
+//                  full importedData in localStorage, so the next push from
+//                  each device repopulates the owner's state.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import Database from "better-sqlite3";
 import type { RelayConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { Metrics } from "./metrics.js";
@@ -42,6 +48,103 @@ export function createAdminServer(
         version: pkg.version,
       }),
     );
+  }
+
+  // POST /compact-owner?ownerId=<base64url-22-char>
+  // Drops every evolu_message row for the given owner and resets
+  // evolu_usage.storedBytes to 0. Use when an owner has hit the per-owner
+  // quota: the running counter never decrements on its own (Evolu has no
+  // built-in compaction), so once a long-lived owner crosses the limit
+  // every push fails with quota.owner_exceeded until this is called.
+  // Clients keep their full state in localStorage; the next push from each
+  // device re-establishes the owner's CRDT state on the relay.
+  function handleCompactOwner(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): void {
+    const ownerIdStr = url.searchParams.get("ownerId");
+    if (!ownerIdStr || ownerIdStr.length !== 22) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "ownerId query param required (22-char base64url Evolu OwnerId)",
+        }),
+      );
+      return;
+    }
+    let ownerId: Buffer;
+    try {
+      ownerId = Buffer.from(ownerIdStr, "base64url");
+      if (ownerId.length !== 16) throw new Error("decoded length != 16");
+    } catch (e) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: `Invalid ownerId: ${(e as Error).message}`,
+        }),
+      );
+      return;
+    }
+    const dbPath = join(config.dataDir, `${config.relayName}.db`);
+    let db: Database.Database | null = null;
+    try {
+      db = new Database(dbPath, { fileMustExist: true });
+      const before = db
+        .prepare(
+          'SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?',
+        )
+        .get(ownerId) as { storedBytes: number } | undefined;
+      const msgCount = db
+        .prepare(
+          'SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?',
+        )
+        .get(ownerId) as { c: number };
+      const tx = db.transaction(() => {
+        db!
+          .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
+          .run(ownerId);
+        db!
+          .prepare('UPDATE evolu_usage SET "storedBytes" = 0 WHERE "ownerId" = ?')
+          .run(ownerId);
+      });
+      tx();
+      const after = db
+        .prepare(
+          'SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?',
+        )
+        .get(ownerId) as { storedBytes: number } | undefined;
+      logger.emit("info", "admin.compact_owner", {
+        ownerId: ownerIdStr,
+        deletedMessages: msgCount.c,
+        beforeStoredBytes: before?.storedBytes ?? 0,
+        afterStoredBytes: after?.storedBytes ?? 0,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          {
+            ownerId: ownerIdStr,
+            deletedMessages: msgCount.c,
+            beforeStoredBytes: before?.storedBytes ?? 0,
+            afterStoredBytes: after?.storedBytes ?? 0,
+          },
+          null,
+          2,
+        ),
+      );
+    } catch (e) {
+      logger.emit("warn", "admin.compact_owner_failed", {
+        ownerId: ownerIdStr,
+        error: (e as Error).message,
+      });
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: (e as Error).message }));
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
   }
 
   function handleMetrics(_req: IncomingMessage, res: ServerResponse): void {
@@ -94,6 +197,10 @@ export function createAdminServer(
 
     if (req.method === "GET" && url.pathname === "/metrics") {
       return handleMetrics(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/compact-owner") {
+      return handleCompactOwner(req, res, url);
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });

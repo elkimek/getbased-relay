@@ -77,6 +77,7 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 
 - `GET /health` — Always public. Returns `{"status":"ok","uptime":...}`
 - `GET /metrics` — Requires `Authorization: Bearer <ADMIN_TOKEN>` if configured. Returns owner count, per-owner storage, DB size, connection count, quota settings.
+- `POST /compact-owner?ownerId=<base64url-22-char>` — Requires `Authorization: Bearer <ADMIN_TOKEN>`. Drops every `evolu_message` row for the given owner and resets `evolu_usage.storedBytes` to 0. Use when an owner has hit the per-owner quota (`quota.owner_exceeded` warnings) — the running counter never decrements on its own (Evolu has no built-in compaction). Clients keep their full state in localStorage; the next push from each device re-establishes the owner's CRDT state on the relay. Response body: `{ownerId, deletedMessages, beforeStoredBytes, afterStoredBytes}`.
 
 ## Reverse proxy
 
