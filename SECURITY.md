@@ -11,7 +11,7 @@ I'll acknowledge receipt within 48 hours and aim to release a fix within 7 days 
 ## Scope
 
 - Relay WebSocket server and CRDT sync protocol
-- Admin HTTP server (health/metrics endpoints)
+- Admin HTTP server (health, metrics, compact-owner endpoints)
 - Authentication (ADMIN_TOKEN bearer auth)
 - SQLite database access and quota management
 - Docker container security
