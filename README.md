@@ -152,4 +152,6 @@ Built on [Evolu](https://github.com/evoluhq/evolu) by [Daniel Steigerwald](https
 
 ## License
 
-GPL-3.0
+AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+If you run a modified version of this relay as a network service, AGPLv3 §13 requires you to offer your users the corresponding source.
