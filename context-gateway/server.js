@@ -54,14 +54,24 @@ const server = createServer((req, res) => {
           try { stored = JSON.parse(readFileSync(filePath, 'utf8')); } catch {}
         }
 
+        // Allowlist regex on profileId — defense against prototype-pollution
+        // (`__proto__` / `constructor` / `prototype` would otherwise mutate
+        // every object's chain via `stored.contexts[profileId] = ...`).
         const profileId = data.profileId || 'default';
+        if (typeof profileId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(profileId)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid profileId — must be [a-zA-Z0-9_-]+' }));
+          return;
+        }
 
-        // Migrate: if old format (flat context), move it into contexts map
+        // Migrate: if old format (flat context), move it into contexts map.
+        // Use Object.create(null) for the contexts map so __proto__ can't be
+        // a magic key even if validation is bypassed.
         if (stored.context && !stored.contexts) {
-          stored.contexts = { default: stored.context };
+          stored.contexts = Object.assign(Object.create(null), { default: stored.context });
           delete stored.context;
         }
-        if (!stored.contexts) stored.contexts = {};
+        if (!stored.contexts) stored.contexts = Object.create(null);
 
         stored.contexts[profileId] = data.context;
         stored.profiles = data.profiles || stored.profiles || null;
