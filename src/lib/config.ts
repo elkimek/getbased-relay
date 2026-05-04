@@ -44,8 +44,15 @@ export function loadConfig(): RelayConfig {
     // since they're harmless without an existing client + writeKey, but
     // operators can hard-disable with SELF_ENABLED=0 if they prefer to
     // route everything through the admin token.
+    //
+    // Bind defaults to 127.0.0.1 — the safe default. Operators who want
+    // to expose the port directly to the public internet (instead of
+    // proxying through Caddy/nginx) must explicitly set SELF_BIND=0.0.0.0
+    // and accept the surface area. The HMAC + rate limit cap the worst
+    // case but a localhost-only default removes the foot-gun for
+    // someone who copy-pastes the compose file without reading the README.
     selfPort: envInt("SELF_PORT", 4003),
-    selfBind: envStr("SELF_BIND", "0.0.0.0"),
+    selfBind: envStr("SELF_BIND", "127.0.0.1"),
     selfEnabled: envBool("SELF_ENABLED", true),
     relayName: envStr("RELAY_NAME", "evolu-relay"),
     dataDir: resolve(envStr("DATA_DIR", "./data")),

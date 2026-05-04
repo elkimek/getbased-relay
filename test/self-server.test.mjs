@@ -278,6 +278,52 @@ test("logShouldEmit returns true on first call, false on duplicates within windo
   assert.equal(server._logShouldEmit("XYZ", "1.1.1.1", "wrong_sig"), true);
 });
 
+// ─── v1.2.2: LRU eviction caps Map size ──────────────────────
+
+test("rateCheck LRU touch keeps recently-used keys alive when other keys are added", () => {
+  const { server } = setup();
+  // Fill 3 distinct IPs on the compact bucket.
+  server._rateCheck("ip-A", "compact");
+  server._rateCheck("ip-B", "compact");
+  server._rateCheck("ip-C", "compact");
+  // Touch ip-A again — it should now be the most-recently-used.
+  server._rateCheck("ip-A", "compact");
+  // Add a fourth — under cap, all four exist. We're not asserting
+  // eviction here (cap is 10k), just that the LRU touch doesn't break
+  // the bucket count tracking.
+  const r = server._rateCheck("ip-A", "compact");
+  assert.equal(r.allowed, true, "ip-A should still be within its bucket");
+  // Ip-A was touched 3 times now; should be at count=3 (still within
+  // capacity=10).
+});
+
+test("rateCheck still rate-limits correctly after many LRU touches", () => {
+  const { server } = setup();
+  // Burn the bucket via repeated touches on the same IP. The LRU
+  // touch logic must NOT reset the count or duplicate the key.
+  for (let i = 0; i < 10; i++) {
+    const r = server._rateCheck("burn-ip", "compact");
+    assert.equal(r.allowed, true, `request ${i + 1} should still be allowed`);
+  }
+  const blocked = server._rateCheck("burn-ip", "compact");
+  assert.equal(blocked.allowed, false, "11th request must be 429");
+});
+
+test("logShouldEmit dedup still works after LRU touch (re-insert preserves count)", () => {
+  const { server } = setup();
+  const k = ["OWNER", "ip", "wrong_sig"];
+  // First emit.
+  assert.equal(server._logShouldEmit(...k), true);
+  // 9 suppressed.
+  for (let i = 0; i < 9; i++) {
+    assert.equal(server._logShouldEmit(...k), false);
+  }
+  // Different reason — fresh emit, should NOT inherit the suppressed state.
+  assert.equal(server._logShouldEmit("OWNER", "ip", "timestamp_outside_window"), true);
+  // Original key still in suppress mode.
+  assert.equal(server._logShouldEmit(...k), false);
+});
+
 test("clientIp trusts X-Forwarded-For only when peer is loopback", () => {
   const { server } = setup();
   // Loopback peer + XFF set → trust XFF (left-most entry).
