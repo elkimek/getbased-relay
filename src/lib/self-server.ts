@@ -42,7 +42,43 @@ import type { Logger } from "./logger.js";
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const MAX_BODY_BYTES = 4096;
 
+// Per-IP token-bucket rate limit. Compact is bandwidth-cheap but does
+// real DB work (DELETE + UPDATE under WAL lock); storage is just a
+// SELECT. Compact gets the tighter cap. Both are generous enough that
+// a real user with one device + occasional refreshes never trips them,
+// but a captured-signature replay flood is bounded.
+const RATE_LIMITS: Record<string, { capacity: number; windowMs: number }> = {
+  "compact": { capacity: 10, windowMs: 60 * 1000 },
+  "storage": { capacity: 60, windowMs: 60 * 1000 },
+};
+// Coalesce repeated unauthorized log lines per (ownerId, ip, reason).
+// First failure logs immediately; same key within window suppresses
+// (with a count summary on window expiry). Without this, a spammer
+// can fill the log with thousands of identical "wrong sig" warnings.
+const LOG_COALESCE_WINDOW_MS = 60 * 1000;
+
 type WriteKeyLookup = (ownerId: Buffer) => Buffer | null;
+
+interface BucketState { count: number; resetAt: number }
+interface CoalesceState { count: number; firstAt: number; expiresAt: number }
+
+// Pull the real client IP. When req.socket is loopback (relay sits
+// behind Caddy on the same host), trust X-Forwarded-For — Caddy sets
+// it by default on reverse_proxy. Otherwise use the socket peer.
+// Multi-hop XFF: we want the LEFTMOST entry (the original client),
+// since intermediate proxies append to the right.
+function clientIp(req: IncomingMessage): string {
+  const peer = req.socket.remoteAddress || "0.0.0.0";
+  const isLoopback = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
+  if (isLoopback) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.length > 0) {
+      const first = xff.split(",")[0]?.trim();
+      if (first) return first;
+    }
+  }
+  return peer;
+}
 
 // Decode a 22-char base64url ownerId to its 16-byte form. Returns null
 // for any malformed input (length, alphabet, decoded length) so callers
@@ -144,6 +180,72 @@ export function createSelfServer(
   config: RelayConfig,
   logger: Logger,
 ) {
+  // ─── Rate limit + log coalesce state ────────────────────────
+  // Both keyed by string. Cleaned up by a periodic sweep so neither
+  // map grows unbounded under a long-running scan flood.
+  const buckets = new Map<string, BucketState>();
+  const coalesce = new Map<string, CoalesceState>();
+
+  // Returns true if the request fits the bucket; false if rate-limited.
+  // Caller maps false → 429 with Retry-After.
+  function rateCheck(ip: string, route: keyof typeof RATE_LIMITS): { allowed: boolean; retryAfterSec: number } {
+    const cfg = RATE_LIMITS[route];
+    const now = Date.now();
+    const key = `${ip}:${route}`;
+    const cur = buckets.get(key);
+    if (!cur || cur.resetAt <= now) {
+      buckets.set(key, { count: 1, resetAt: now + cfg.windowMs });
+      return { allowed: true, retryAfterSec: 0 };
+    }
+    if (cur.count < cfg.capacity) {
+      cur.count += 1;
+      return { allowed: true, retryAfterSec: 0 };
+    }
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((cur.resetAt - now) / 1000)) };
+  }
+
+  // Returns true if this is a "fresh" event that should be logged
+  // immediately. Subsequent failures matching the same (ownerId, ip,
+  // reason) within the window increment a counter without logging.
+  // The sweep below emits a "coalesced N within Xs" summary on
+  // window expiry if N > 1.
+  function logShouldEmit(ownerIdStr: string, ip: string, reason: string): boolean {
+    const key = `${ownerIdStr}|${ip}|${reason}`;
+    const now = Date.now();
+    const cur = coalesce.get(key);
+    if (!cur || cur.expiresAt <= now) {
+      coalesce.set(key, { count: 1, firstAt: now, expiresAt: now + LOG_COALESCE_WINDOW_MS });
+      return true;
+    }
+    cur.count += 1;
+    return false;
+  }
+
+  // Periodic sweep — drops expired buckets + emits coalesce-summary
+  // log lines for any keys whose window just closed with count > 1.
+  // 30s cadence is twice the smallest window so we never miss a bucket
+  // by more than one window in the worst case.
+  const sweepInterval = setInterval(() => {
+    const now = Date.now();
+    for (const [k, b] of buckets) if (b.resetAt <= now) buckets.delete(k);
+    for (const [k, c] of coalesce) {
+      if (c.expiresAt <= now) {
+        if (c.count > 1) {
+          const [ownerId, ip, reason] = k.split("|");
+          logger.emit("warn", "self.coalesced_unauthorized", {
+            ownerId, ip, reason,
+            count: c.count,
+            windowMs: now - c.firstAt,
+          });
+        }
+        coalesce.delete(k);
+      }
+    }
+  }, 30 * 1000);
+  // Don't keep the event loop alive on this — relay shutdown should
+  // not have to wait for a 30s timer to fire.
+  if (typeof sweepInterval.unref === "function") sweepInterval.unref();
+
   // Lazily open and reuse a single read-handle for writeKey lookups.
   // Compaction itself opens a fresh write-handle per call (matching the
   // admin path) — keeps the read path responsive even while a compact
@@ -170,6 +272,13 @@ export function createSelfServer(
     req: IncomingMessage,
     res: ServerResponse,
   ): Promise<void> {
+    const ip = clientIp(req);
+    const rl = rateCheck(ip, "compact");
+    if (!rl.allowed) {
+      res.setHeader("Retry-After", String(rl.retryAfterSec));
+      jsonResponse(res, 429, { error: "rate_limited", retryAfterSec: rl.retryAfterSec });
+      return;
+    }
     let body: { ownerId?: unknown; timestamp?: unknown; signature?: unknown };
     try {
       body = await readJsonBody(req);
@@ -195,10 +304,13 @@ export function createSelfServer(
       lookupWriteKey,
     );
     if (authErr) {
-      logger.emit("warn", "self.compact_owner_unauthorized", {
-        ownerId: ownerIdStr,
-        reason: authErr.error,
-      });
+      if (logShouldEmit(ownerIdStr, ip, `compact:${authErr.error}`)) {
+        logger.emit("warn", "self.compact_owner_unauthorized", {
+          ownerId: ownerIdStr,
+          ip,
+          reason: authErr.error,
+        });
+      }
       jsonResponse(res, authErr.status, { error: authErr.error });
       return;
     }
@@ -261,6 +373,13 @@ export function createSelfServer(
     res: ServerResponse,
     url: URL,
   ): void {
+    const ip = clientIp(req);
+    const rl = rateCheck(ip, "storage");
+    if (!rl.allowed) {
+      res.setHeader("Retry-After", String(rl.retryAfterSec));
+      jsonResponse(res, 429, { error: "rate_limited", retryAfterSec: rl.retryAfterSec });
+      return;
+    }
     const ownerIdStr = url.searchParams.get("ownerId");
     const ownerId = decodeOwnerId(ownerIdStr);
     if (!ownerId || !ownerIdStr) {
@@ -278,10 +397,13 @@ export function createSelfServer(
       lookupWriteKey,
     );
     if (authErr) {
-      logger.emit("warn", "self.owner_storage_unauthorized", {
-        ownerId: ownerIdStr,
-        reason: authErr.error,
-      });
+      if (logShouldEmit(ownerIdStr, ip, `storage:${authErr.error}`)) {
+        logger.emit("warn", "self.owner_storage_unauthorized", {
+          ownerId: ownerIdStr,
+          ip,
+          reason: authErr.error,
+        });
+      }
       jsonResponse(res, authErr.status, { error: authErr.error });
       return;
     }
@@ -361,6 +483,7 @@ export function createSelfServer(
 
   function stop(): Promise<void> {
     return new Promise((resolve) => {
+      try { clearInterval(sweepInterval); } catch {}
       try { lookupDb?.close(); } catch {}
       lookupDb = null;
       server.close(() => resolve());
@@ -369,5 +492,13 @@ export function createSelfServer(
 
   // Exported for tests — verifySignature has no side effects so it's
   // safe to expose as a pure helper.
-  return { start, stop, _verifySignature: verifySignature, _decodeOwnerId: decodeOwnerId };
+  return {
+    start,
+    stop,
+    _verifySignature: verifySignature,
+    _decodeOwnerId: decodeOwnerId,
+    _rateCheck: rateCheck,
+    _logShouldEmit: logShouldEmit,
+    _clientIp: clientIp,
+  };
 }

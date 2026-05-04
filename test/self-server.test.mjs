@@ -228,3 +228,83 @@ test("verifySignature rejects malformed signature hex", () => {
   );
   assert.deepEqual(result, { status: 401, error: "invalid_signature_format" });
 });
+
+// ─── v1.2.1: rate limit + log coalescing ──────────────────────
+
+test("rateCheck allows up to bucket capacity, then 429s", () => {
+  const { server } = setup();
+  const ip = "1.2.3.4";
+  // compact bucket = 10/min. First 10 must pass, 11th must trip.
+  for (let i = 0; i < 10; i++) {
+    const r = server._rateCheck(ip, "compact");
+    assert.equal(r.allowed, true, `request ${i + 1} should be allowed`);
+  }
+  const blocked = server._rateCheck(ip, "compact");
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.retryAfterSec >= 1, "retryAfterSec should be a positive integer");
+});
+
+test("rateCheck buckets are per-IP + per-route (one IP doesn't drain another's quota)", () => {
+  const { server } = setup();
+  // Drain compact for IP A.
+  for (let i = 0; i < 10; i++) server._rateCheck("10.0.0.1", "compact");
+  assert.equal(server._rateCheck("10.0.0.1", "compact").allowed, false);
+  // IP B still fresh on compact.
+  assert.equal(server._rateCheck("10.0.0.2", "compact").allowed, true);
+  // IP A still fresh on storage (different bucket).
+  assert.equal(server._rateCheck("10.0.0.1", "storage").allowed, true);
+});
+
+test("rateCheck storage bucket is more generous than compact (60 vs 10)", () => {
+  const { server } = setup();
+  // Storage should allow at least 11 in a row (proves it's not the
+  // compact bucket).
+  for (let i = 0; i < 11; i++) {
+    const r = server._rateCheck("5.5.5.5", "storage");
+    assert.equal(r.allowed, true, `storage request ${i + 1} should be allowed`);
+  }
+});
+
+test("logShouldEmit returns true on first call, false on duplicates within window", () => {
+  const { server } = setup();
+  assert.equal(server._logShouldEmit("ABC", "1.1.1.1", "wrong_sig"), true);
+  assert.equal(server._logShouldEmit("ABC", "1.1.1.1", "wrong_sig"), false);
+  assert.equal(server._logShouldEmit("ABC", "1.1.1.1", "wrong_sig"), false);
+  // Different reason → fresh emit.
+  assert.equal(server._logShouldEmit("ABC", "1.1.1.1", "timestamp_outside_window"), true);
+  // Different IP → fresh emit.
+  assert.equal(server._logShouldEmit("ABC", "2.2.2.2", "wrong_sig"), true);
+  // Different ownerId → fresh emit.
+  assert.equal(server._logShouldEmit("XYZ", "1.1.1.1", "wrong_sig"), true);
+});
+
+test("clientIp trusts X-Forwarded-For only when peer is loopback", () => {
+  const { server } = setup();
+  // Loopback peer + XFF set → trust XFF (left-most entry).
+  const fakeReq1 = {
+    socket: { remoteAddress: "127.0.0.1" },
+    headers: { "x-forwarded-for": "203.0.113.5, 10.0.0.1" },
+  };
+  assert.equal(server._clientIp(fakeReq1), "203.0.113.5");
+  // ::1 also loopback.
+  const fakeReq2 = {
+    socket: { remoteAddress: "::1" },
+    headers: { "x-forwarded-for": "203.0.113.5" },
+  };
+  assert.equal(server._clientIp(fakeReq2), "203.0.113.5");
+  // ::ffff:127.0.0.1 also loopback (IPv4-in-IPv6).
+  const fakeReq3 = {
+    socket: { remoteAddress: "::ffff:127.0.0.1" },
+    headers: { "x-forwarded-for": "203.0.113.5" },
+  };
+  assert.equal(server._clientIp(fakeReq3), "203.0.113.5");
+  // Non-loopback peer + XFF → ignore XFF (don't trust unauthenticated header).
+  const fakeReq4 = {
+    socket: { remoteAddress: "203.0.113.99" },
+    headers: { "x-forwarded-for": "1.2.3.4" },
+  };
+  assert.equal(server._clientIp(fakeReq4), "203.0.113.99");
+  // No headers + no socket → 0.0.0.0 fallback.
+  const fakeReq5 = { socket: {}, headers: {} };
+  assert.equal(server._clientIp(fakeReq5), "0.0.0.0");
+});

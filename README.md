@@ -89,6 +89,10 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 
 **Auth scheme.** `signature = HMAC-SHA256(writeKey, "{context}:{ownerId}:{timestamp}").hex()` where `context` is `"compact"` or `"storage"`. The relay looks up the writeKey in its `evolu_writeKey` table (the same secret the Evolu client already holds for pushes), recomputes the HMAC, and timing-safe-compares. The timestamp must be within ±5 minutes of server time. All auth failures return a uniform `401 unauthorized` to avoid an owner-existence oracle.
 
+**Rate limit.** Per-IP token bucket caps `/self/compact-owner` at 10 requests/minute and `/self/owner-storage` at 60 requests/minute. Excess returns `429` with a `Retry-After` header. When the relay is behind a reverse proxy on the same host (peer = loopback), the limiter trusts the leftmost `X-Forwarded-For` entry; otherwise it uses the socket peer. Caddy's `reverse_proxy` directive sets `X-Forwarded-For` automatically, so no extra config is needed.
+
+**Log coalescing.** Repeated unauthorized requests with the same `(ownerId, IP, reason)` are logged once on first occurrence; further hits within 60 s suppress, and a `self.coalesced_unauthorized` summary fires on window expiry if the count exceeded 1. Stops a flood from filling the log without losing the first signal of any abuse pattern.
+
 ## Reverse proxy
 
 The relay port serves WebSocket only. Use Caddy or nginx for TLS termination:
