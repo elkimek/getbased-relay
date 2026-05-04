@@ -22,6 +22,6 @@ RUN mkdir -p /data && chown node:node /data
 ENV DATA_DIR=/data
 ENV NODE_ENV=production
 
-EXPOSE 4000 4001
+EXPOSE 4000 4001 4003
 USER node
 CMD ["node", "dist/index.js"]

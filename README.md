@@ -58,6 +58,9 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 |---|---|---|
 | `RELAY_PORT` | `4000` | Evolu WebSocket relay port |
 | `ADMIN_PORT` | `4001` | Health/metrics HTTP port |
+| `SELF_PORT` | `4003` | Owner-scoped self-service HTTP port |
+| `SELF_BIND` | `0.0.0.0` | Bind address for self-service port |
+| `SELF_ENABLED` | `true` | Set `false` to disable `/self/*` endpoints |
 | `QUOTA_PER_OWNER_MB` | `10` | Max stored bytes per identity |
 | `QUOTA_GLOBAL_MB` | `1000` | Max total stored bytes |
 | `OWNER_TTL_DAYS` | `90` | Days before owner flagged as stale |
@@ -79,6 +82,13 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 - `GET /metrics` — Requires `Authorization: Bearer <ADMIN_TOKEN>` if configured. Returns owner count, per-owner storage, DB size, connection count, quota settings.
 - `POST /compact-owner?ownerId=<base64url-22-char>` — Requires `Authorization: Bearer <ADMIN_TOKEN>`. Drops every `evolu_message` row for the given owner and resets `evolu_usage.storedBytes` to 0. Use when an owner has hit the per-owner quota (`quota.owner_exceeded` warnings) — the running counter never decrements on its own (Evolu has no built-in compaction). Clients keep their full state in localStorage; the next push from each device re-establishes the owner's CRDT state on the relay. Response body: `{ownerId, deletedMessages, beforeStoredBytes, afterStoredBytes}`.
 
+**Self-service port** (default 4003) — owner-scoped HTTP endpoints, signed with the client's own writeKey. No admin token; one user can never act on another user's owner. Intended to be exposed via the same reverse proxy as the relay port.
+
+- `POST /self/compact-owner` — Body: `{ownerId, timestamp, signature}`. Same effect as `/compact-owner` but client-driven; lets users unwedge themselves when they hit the per-owner quota without round-tripping through the operator. Replaces what was previously a manual SSH-and-curl runbook.
+- `GET /self/owner-storage?ownerId=...&timestamp=...&signature=...` — Returns `{ownerId, storedBytes, quotaBytes}` straight from `evolu_usage` for that owner. Use this to show users an accurate quota readout instead of a cumulative client-side estimate (which drifts the moment compaction runs).
+
+**Auth scheme.** `signature = HMAC-SHA256(writeKey, "{context}:{ownerId}:{timestamp}").hex()` where `context` is `"compact"` or `"storage"`. The relay looks up the writeKey in its `evolu_writeKey` table (the same secret the Evolu client already holds for pushes), recomputes the HMAC, and timing-safe-compares. The timestamp must be within ±5 minutes of server time. All auth failures return a uniform `401 unauthorized` to avoid an owner-existence oracle.
+
 ## Reverse proxy
 
 The relay port serves WebSocket only. Use Caddy or nginx for TLS termination:
@@ -88,9 +98,13 @@ The relay port serves WebSocket only. Use Caddy or nginx for TLS termination:
 sync.example.com {
     reverse_proxy localhost:4000
 }
+
+self.example.com {
+    reverse_proxy localhost:4003
+}
 ```
 
-The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxied route.
+The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxied route. The self-service port can be exposed publicly: every endpoint is HMAC-authed against per-owner writeKeys, no admin secret involved.
 
 ## Architecture
 

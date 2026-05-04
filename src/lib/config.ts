@@ -3,6 +3,9 @@ import { resolve } from "path";
 export interface RelayConfig {
   relayPort: number;
   adminPort: number;
+  selfPort: number;
+  selfBind: string;
+  selfEnabled: boolean;
   relayName: string;
   dataDir: string;
   quotaPerOwnerBytes: number;
@@ -37,6 +40,13 @@ export function loadConfig(): RelayConfig {
   const config: RelayConfig = {
     relayPort: envInt("RELAY_PORT", 4000),
     adminPort: envInt("ADMIN_PORT", 4001),
+    // Self-service endpoints (HMAC-authed, owner-scoped). Default-on
+    // since they're harmless without an existing client + writeKey, but
+    // operators can hard-disable with SELF_ENABLED=0 if they prefer to
+    // route everything through the admin token.
+    selfPort: envInt("SELF_PORT", 4003),
+    selfBind: envStr("SELF_BIND", "0.0.0.0"),
+    selfEnabled: envBool("SELF_ENABLED", true),
     relayName: envStr("RELAY_NAME", "evolu-relay"),
     dataDir: resolve(envStr("DATA_DIR", "./data")),
     quotaPerOwnerBytes: envInt("QUOTA_PER_OWNER_MB", 10) * 1024 * 1024,
@@ -50,6 +60,11 @@ export function loadConfig(): RelayConfig {
 
   if (config.relayPort === config.adminPort) {
     throw new Error("RELAY_PORT and ADMIN_PORT must be different");
+  }
+  if (config.selfEnabled) {
+    if (config.selfPort === config.relayPort || config.selfPort === config.adminPort) {
+      throw new Error("SELF_PORT must differ from RELAY_PORT and ADMIN_PORT");
+    }
   }
 
   return config;

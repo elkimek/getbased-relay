@@ -10,6 +10,7 @@ import { createQuotaChecker } from "./lib/quota.js";
 import { createOwnerTracker } from "./lib/owner-tracker.js";
 import { createMetrics } from "./lib/metrics.js";
 import { createAdminServer } from "./lib/admin-server.js";
+import { createSelfServer } from "./lib/self-server.js";
 import { runStartupChecks } from "./lib/startup-check.js";
 
 // ─── Config ────────────────────────────────────────────
@@ -19,6 +20,8 @@ const logger = createLogger(config);
 logger.emit("info", "relay.config", {
   relayPort: config.relayPort,
   adminPort: config.adminPort,
+  selfPort: config.selfEnabled ? config.selfPort : null,
+  selfBind: config.selfEnabled ? config.selfBind : null,
   dataDir: config.dataDir,
   quotaPerOwnerMB: config.quotaPerOwnerBytes / (1024 * 1024),
   quotaGlobalMB: config.quotaGlobalBytes / (1024 * 1024),
@@ -73,9 +76,14 @@ if (!relay.ok) {
 const admin = createAdminServer(config, logger, metrics, ownerTracker);
 await admin.start();
 
+// ─── Self-service server (HMAC-authed, owner-scoped) ──
+const self = config.selfEnabled ? createSelfServer(config, logger) : null;
+if (self) await self.start();
+
 logger.emit("info", "relay.ready", {
   relay: `ws://0.0.0.0:${config.relayPort}`,
   admin: `http://127.0.0.1:${config.adminPort}`,
+  self: self ? `http://${config.selfBind}:${config.selfPort}` : null,
 });
 
 // ─── Graceful shutdown ────────────────────────────────
@@ -94,6 +102,7 @@ async function shutdown(signal: string): Promise<void> {
     logger.emit("warn", "relay.dispose_error", { error: (e as Error).message });
   }
   await admin.stop();
+  if (self) await self.stop();
 
   logger.emit("info", "relay.stopped");
   process.exit(0);

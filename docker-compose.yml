@@ -3,11 +3,18 @@ services:
     build: .
     ports:
       - "4000:4000"
+      # Self-service endpoints (HMAC-authed). Bind 127.0.0.1 on the host
+      # so they only expose through the reverse proxy (Caddy), not
+      # directly to the public IP. Set SELF_ENABLED=0 to turn them off.
+      - "127.0.0.1:4003:4003"
     volumes:
       - relay-data:/data
     environment:
       - RELAY_PORT=4000
       - ADMIN_PORT=4002
+      - SELF_PORT=4003
+      - SELF_BIND=0.0.0.0
+      - SELF_ENABLED=true
       - QUOTA_PER_OWNER_MB=10
       - QUOTA_GLOBAL_MB=1000
       - LOG_FORMAT=json
