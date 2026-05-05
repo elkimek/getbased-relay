@@ -59,7 +59,7 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `RELAY_PORT` | `4000` | Evolu WebSocket relay port |
 | `ADMIN_PORT` | `4001` | Health/metrics HTTP port |
 | `SELF_PORT` | `4003` | Owner-scoped self-service HTTP port |
-| `SELF_BIND` | `0.0.0.0` | Bind address for self-service port |
+| `SELF_BIND` | `127.0.0.1` | Bind address for self-service port (set to `0.0.0.0` to expose directly without a reverse proxy) |
 | `SELF_ENABLED` | `true` | Set `false` to disable `/self/*` endpoints |
 | `QUOTA_PER_OWNER_MB` | `10` | Max stored bytes per identity |
 | `QUOTA_GLOBAL_MB` | `1000` | Max total stored bytes |
@@ -98,7 +98,7 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 The relay port serves WebSocket only. Use Caddy or nginx for TLS termination:
 
 ```
-# Caddyfile
+# Caddyfile — option A: dedicated subdomain per surface
 sync.example.com {
     reverse_proxy localhost:4000
 }
@@ -108,7 +108,21 @@ self.example.com {
 }
 ```
 
-The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxied route. The self-service port can be exposed publicly: every endpoint is HMAC-authed against per-owner writeKeys, no admin secret involved.
+```
+# Caddyfile — option B: single hostname, path-routing (what sync.getbased.health uses)
+sync.example.com {
+    handle /self/* {
+        reverse_proxy 127.0.0.1:4003
+    }
+    handle {
+        reverse_proxy 127.0.0.1:4000
+    }
+}
+```
+
+Both patterns work; the client (`get-based`) derives `https://<relay-hostname>/self/...` from the WebSocket URL by default. For self-hosters who want to skip the reverse proxy entirely (expose port 4003 directly to the internet), set `SELF_BIND=0.0.0.0` and have clients hard-code their own URL via the `labcharts-self-url` localStorage override.
+
+The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxied route. The self-service port defaults to `127.0.0.1` too; both expect a reverse proxy in front. Every `/self/*` endpoint is HMAC-authed against per-owner writeKeys, so it's safe to expose publicly once the reverse proxy is wired.
 
 ## Architecture
 

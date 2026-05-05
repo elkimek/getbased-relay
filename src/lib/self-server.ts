@@ -57,6 +57,23 @@ const RATE_LIMITS: Record<string, { capacity: number; windowMs: number }> = {
 // can fill the log with thousands of identical "wrong sig" warnings.
 const LOG_COALESCE_WINDOW_MS = 60 * 1000;
 
+// Hard cap on rate-limit + coalesce Maps. The 30s sweep below cleans
+// expired entries, but a high-cardinality flood (botnet, scanner
+// rotating millions of IPs) could grow either Map between sweeps.
+// Cap + LRU eviction keeps memory bounded regardless of input shape.
+// 10k entries is generous: at typical relay load it'll never approach
+// the cap even during sweep cycles. Map preserves insertion order, so
+// the first key is the least-recently-touched.
+const MAX_BUCKET_ENTRIES = 10_000;
+const MAX_COALESCE_ENTRIES = 10_000;
+function evictOldest<K, V>(m: Map<K, V>, cap: number): void {
+  while (m.size > cap) {
+    const oldest = m.keys().next().value;
+    if (oldest === undefined) break;
+    m.delete(oldest);
+  }
+}
+
 type WriteKeyLookup = (ownerId: Buffer) => Buffer | null;
 
 interface BucketState { count: number; resetAt: number }
@@ -188,19 +205,29 @@ export function createSelfServer(
 
   // Returns true if the request fits the bucket; false if rate-limited.
   // Caller maps false → 429 with Retry-After.
+  //
+  // LRU touch: every access (allowed or denied) re-insertion-orders
+  // the key so that under MAX_BUCKET_ENTRIES eviction, only truly
+  // idle keys get dropped.
   function rateCheck(ip: string, route: keyof typeof RATE_LIMITS): { allowed: boolean; retryAfterSec: number } {
     const cfg = RATE_LIMITS[route];
     const now = Date.now();
     const key = `${ip}:${route}`;
     const cur = buckets.get(key);
     if (!cur || cur.resetAt <= now) {
+      buckets.delete(key); // ensure fresh insertion-order position
       buckets.set(key, { count: 1, resetAt: now + cfg.windowMs });
+      evictOldest(buckets, MAX_BUCKET_ENTRIES);
       return { allowed: true, retryAfterSec: 0 };
     }
+    // LRU touch: re-insert so this key isn't a candidate for eviction.
+    buckets.delete(key);
     if (cur.count < cfg.capacity) {
       cur.count += 1;
+      buckets.set(key, cur);
       return { allowed: true, retryAfterSec: 0 };
     }
+    buckets.set(key, cur);
     return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((cur.resetAt - now) / 1000)) };
   }
 
@@ -209,15 +236,23 @@ export function createSelfServer(
   // reason) within the window increment a counter without logging.
   // The sweep below emits a "coalesced N within Xs" summary on
   // window expiry if N > 1.
+  //
+  // LRU touch + cap match the rate-limit pattern — protects against
+  // a flood that rotates ownerId/ip/reason fast enough that nothing
+  // expires the natural way.
   function logShouldEmit(ownerIdStr: string, ip: string, reason: string): boolean {
     const key = `${ownerIdStr}|${ip}|${reason}`;
     const now = Date.now();
     const cur = coalesce.get(key);
     if (!cur || cur.expiresAt <= now) {
+      coalesce.delete(key);
       coalesce.set(key, { count: 1, firstAt: now, expiresAt: now + LOG_COALESCE_WINDOW_MS });
+      evictOldest(coalesce, MAX_COALESCE_ENTRIES);
       return true;
     }
+    coalesce.delete(key);
     cur.count += 1;
+    coalesce.set(key, cur);
     return false;
   }
 
