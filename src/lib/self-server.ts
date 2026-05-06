@@ -372,8 +372,18 @@ export function createSelfServer(
         db!
           .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
           .run(ownerId);
+        // Wipe the merkle/fingerprint table too. See admin-server.ts for
+        // the full incident note — TL;DR: leaving evolu_timestamp populated
+        // after evolu_message is gone makes the negentropy reconciliation
+        // report fingerprints for timestamps that no longer have a payload,
+        // so peers' fresh per-row pushes get rejected as "already have it"
+        // and disappear.
         db!
-          .prepare('UPDATE evolu_usage SET "storedBytes" = 0 WHERE "ownerId" = ?')
+          .prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?')
+          .run(ownerId);
+        // Clear first/lastTimestamp too — they pointed at deleted messages.
+        db!
+          .prepare('UPDATE evolu_usage SET "storedBytes" = 0, "firstTimestamp" = NULL, "lastTimestamp" = NULL WHERE "ownerId" = ?')
           .run(ownerId);
         after = db!
           .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')

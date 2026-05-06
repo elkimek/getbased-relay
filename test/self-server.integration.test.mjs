@@ -64,8 +64,18 @@ before(async () => {
   for (let i = 0; i < 5; i++) {
     insertMsg.run(ownerIdBytes, Buffer.from(`ts-${i}`, "utf8"), Buffer.alloc(1000));
   }
-  // Manually set storedBytes to match what a real relay would have.
-  db.prepare('UPDATE evolu_usage SET "storedBytes" = 5000 WHERE "ownerId" = ?').run(ownerIdBytes);
+  // Seed the merkle/fingerprint table the way a real relay populates it
+  // alongside evolu_message. Compact must wipe these too — leaving them
+  // strands the owner because negentropy reports stale fingerprints for
+  // timestamps whose underlying messages we just deleted.
+  const insertTs = db.prepare('INSERT INTO evolu_timestamp ("ownerId", "t", "h1", "h2", "c", "l") VALUES (?, ?, ?, ?, ?, ?)');
+  for (let i = 0; i < 5; i++) {
+    insertTs.run(ownerIdBytes, Buffer.from(`ts-${i}`, "utf8"), 0, 0, 0, 1);
+  }
+  // Manually set storedBytes + first/lastTimestamp to match what a real
+  // relay would have written alongside the messages.
+  db.prepare('UPDATE evolu_usage SET "storedBytes" = 5000, "firstTimestamp" = ?, "lastTimestamp" = ? WHERE "ownerId" = ?')
+    .run(Buffer.from("ts-0", "utf8"), Buffer.from("ts-4", "utf8"), ownerIdBytes);
   db.close();
 
   // Boot the relay listener on a random port (let OS pick).
@@ -127,10 +137,14 @@ test("compact drops every evolu_message row and zeroes storedBytes", async () =>
   // Sanity: precondition.
   const db = new Database(dbPath, { readonly: true });
   const before = db.prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes);
-  const beforeUsage = db.prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?').get(ownerIdBytes);
+  const beforeTs = db.prepare('SELECT COUNT(*) as c FROM evolu_timestamp WHERE "ownerId" = ?').get(ownerIdBytes);
+  const beforeUsage = db.prepare('SELECT "storedBytes", "firstTimestamp", "lastTimestamp" FROM evolu_usage WHERE "ownerId" = ?').get(ownerIdBytes);
   db.close();
   assert.equal(before.c, 5, "should have 5 message rows before compact");
+  assert.equal(beforeTs.c, 5, "should have 5 timestamp/fingerprint rows before compact");
   assert.equal(beforeUsage.storedBytes, 5000, "should have 5000 storedBytes before");
+  assert.notEqual(beforeUsage.firstTimestamp, null, "firstTimestamp should be seeded");
+  assert.notEqual(beforeUsage.lastTimestamp, null, "lastTimestamp should be seeded");
 
   // Sign + send compact.
   const ts = Date.now();
@@ -150,10 +164,19 @@ test("compact drops every evolu_message row and zeroes storedBytes", async () =>
   // Verify the actual DB state matches the response.
   const db2 = new Database(dbPath, { readonly: true });
   const after = db2.prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes);
-  const afterUsage = db2.prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?').get(ownerIdBytes);
+  const afterTs = db2.prepare('SELECT COUNT(*) as c FROM evolu_timestamp WHERE "ownerId" = ?').get(ownerIdBytes);
+  const afterUsage = db2.prepare('SELECT "storedBytes", "firstTimestamp", "lastTimestamp" FROM evolu_usage WHERE "ownerId" = ?').get(ownerIdBytes);
   db2.close();
   assert.equal(after.c, 0, "should have 0 message rows after compact");
+  // Critical regression guard: leaving evolu_timestamp populated after
+  // evolu_message is empty makes the negentropy reconciliation report
+  // fingerprints for timestamps that no longer have a payload, so
+  // peers' fresh per-row pushes get rejected as "already have it" and
+  // disappear. Verified in production 2026-05-06.
+  assert.equal(afterTs.c, 0, "should have 0 timestamp/fingerprint rows after compact (else fresh pushes get stranded)");
   assert.equal(afterUsage.storedBytes, 0, "should have 0 storedBytes after");
+  assert.equal(afterUsage.firstTimestamp, null, "firstTimestamp should be cleared (pointed at deleted messages)");
+  assert.equal(afterUsage.lastTimestamp, null, "lastTimestamp should be cleared (pointed at deleted messages)");
 });
 
 test("compact is idempotent (second call returns deletedMessages=0)", async () => {

@@ -123,8 +123,24 @@ export function createAdminServer(
         db!
           .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
           .run(ownerId);
+        // Wipe the merkle/fingerprint table too. Without this, Evolu's
+        // negentropy reconciliation reports stale fingerprints based on
+        // timestamps whose underlying messages we just deleted — peers
+        // that try to push fresh per-row state get told "you already
+        // have it", their changes evaporate, and the relay never refills.
+        // Verified in production 2026-05-06 on a 6.5K-message owner:
+        // post-compact evolu_message=3 (3 stragglers) but evolu_timestamp
+        // still held 6786 rows, stranding every subsequent client push.
         db!
-          .prepare('UPDATE evolu_usage SET "storedBytes" = 0 WHERE "ownerId" = ?')
+          .prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?')
+          .run(ownerId);
+        // Clear firstTimestamp/lastTimestamp too — they pointed at
+        // messages we just deleted, so leaving them set keeps stale
+        // bookkeeping that getOwnerUsage falls back to on the next
+        // write. Compact's contract is "this owner's storage is empty
+        // again"; that should match what evolu_usage reports.
+        db!
+          .prepare('UPDATE evolu_usage SET "storedBytes" = 0, "firstTimestamp" = NULL, "lastTimestamp" = NULL WHERE "ownerId" = ?')
           .run(ownerId);
         after = db!
           .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
