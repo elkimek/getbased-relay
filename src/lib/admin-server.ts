@@ -17,6 +17,7 @@ import type { RelayConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import type { Metrics } from "./metrics.js";
 import type { OwnerTracker } from "./owner-tracker.js";
+import { compactOwner } from "./compact-owner.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(
@@ -105,67 +106,15 @@ export function createAdminServer(
       // is too short for a busy relay where the writer holds the lock during
       // a large batch ingest.
       db.pragma("busy_timeout = 30000");
-      // Run the SELECTs inside the same transaction so the deletedMessages
-      // count + before/after storedBytes are consistent with the DELETE/UPDATE
-      // — without this, a concurrent push between the SELECT and the write
-      // would yield a slightly stale count in the response.
-      let before: { storedBytes: number } | undefined;
-      let after: { storedBytes: number } | undefined;
-      let deletedMessages = 0;
-      const tx = db.transaction(() => {
-        before = db!
-          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
-          .get(ownerId) as { storedBytes: number } | undefined;
-        const cnt = db!
-          .prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?')
-          .get(ownerId) as { c: number };
-        deletedMessages = cnt.c;
-        db!
-          .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
-          .run(ownerId);
-        // Wipe the merkle/fingerprint table too. Without this, Evolu's
-        // negentropy reconciliation reports stale fingerprints based on
-        // timestamps whose underlying messages we just deleted — peers
-        // that try to push fresh per-row state get told "you already
-        // have it", their changes evaporate, and the relay never refills.
-        // Verified in production 2026-05-06 on a 6.5K-message owner:
-        // post-compact evolu_message=3 (3 stragglers) but evolu_timestamp
-        // still held 6786 rows, stranding every subsequent client push.
-        db!
-          .prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?')
-          .run(ownerId);
-        // Clear firstTimestamp/lastTimestamp too — they pointed at
-        // messages we just deleted, so leaving them set keeps stale
-        // bookkeeping that getOwnerUsage falls back to on the next
-        // write. Compact's contract is "this owner's storage is empty
-        // again"; that should match what evolu_usage reports.
-        db!
-          .prepare('UPDATE evolu_usage SET "storedBytes" = 0, "firstTimestamp" = NULL, "lastTimestamp" = NULL WHERE "ownerId" = ?')
-          .run(ownerId);
-        after = db!
-          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
-          .get(ownerId) as { storedBytes: number } | undefined;
-      });
-      tx();
+      // Shared transaction with /self/compact-owner — single source of
+      // truth for what "compact this owner" means (see compact-owner.ts).
+      const result = compactOwner(db, ownerId);
       logger.emit("info", "admin.compact_owner", {
         ownerId: ownerIdStr,
-        deletedMessages,
-        beforeStoredBytes: before?.storedBytes ?? 0,
-        afterStoredBytes: after?.storedBytes ?? 0,
+        ...result,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify(
-          {
-            ownerId: ownerIdStr,
-            deletedMessages,
-            beforeStoredBytes: before?.storedBytes ?? 0,
-            afterStoredBytes: after?.storedBytes ?? 0,
-          },
-          null,
-          2,
-        ),
-      );
+      res.end(JSON.stringify({ ownerId: ownerIdStr, ...result }, null, 2));
     } catch (e) {
       logger.emit("warn", "admin.compact_owner_failed", {
         ownerId: ownerIdStr,

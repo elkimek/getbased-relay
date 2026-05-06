@@ -38,6 +38,7 @@ import { join } from "path";
 import Database from "better-sqlite3";
 import type { RelayConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import { compactOwner } from "./compact-owner.js";
 
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const MAX_BODY_BYTES = 4096;
@@ -350,7 +351,8 @@ export function createSelfServer(
       return;
     }
 
-    // Run the same DELETE/UPDATE transaction as /admin/compact-owner.
+    // Shared transaction with /admin/compact-owner — single source of
+    // truth for what "compact this owner" means (see compact-owner.ts).
     // Open a fresh write-handle so we don't hold the lookup-DB hostage
     // during the WAL wait.
     const dbPath = join(config.dataDir, `${config.relayName}.db`);
@@ -358,50 +360,12 @@ export function createSelfServer(
     try {
       db = new Database(dbPath, { fileMustExist: true });
       db.pragma("busy_timeout = 30000");
-      let before: { storedBytes: number } | undefined;
-      let after: { storedBytes: number } | undefined;
-      let deletedMessages = 0;
-      const tx = db.transaction(() => {
-        before = db!
-          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
-          .get(ownerId) as { storedBytes: number } | undefined;
-        const cnt = db!
-          .prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?')
-          .get(ownerId) as { c: number };
-        deletedMessages = cnt.c;
-        db!
-          .prepare('DELETE FROM evolu_message WHERE "ownerId" = ?')
-          .run(ownerId);
-        // Wipe the merkle/fingerprint table too. See admin-server.ts for
-        // the full incident note — TL;DR: leaving evolu_timestamp populated
-        // after evolu_message is gone makes the negentropy reconciliation
-        // report fingerprints for timestamps that no longer have a payload,
-        // so peers' fresh per-row pushes get rejected as "already have it"
-        // and disappear.
-        db!
-          .prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?')
-          .run(ownerId);
-        // Clear first/lastTimestamp too — they pointed at deleted messages.
-        db!
-          .prepare('UPDATE evolu_usage SET "storedBytes" = 0, "firstTimestamp" = NULL, "lastTimestamp" = NULL WHERE "ownerId" = ?')
-          .run(ownerId);
-        after = db!
-          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
-          .get(ownerId) as { storedBytes: number } | undefined;
-      });
-      tx();
+      const result = compactOwner(db, ownerId);
       logger.emit("info", "self.compact_owner", {
         ownerId: ownerIdStr,
-        deletedMessages,
-        beforeStoredBytes: before?.storedBytes ?? 0,
-        afterStoredBytes: after?.storedBytes ?? 0,
+        ...result,
       });
-      jsonResponse(res, 200, {
-        ownerId: ownerIdStr,
-        deletedMessages,
-        beforeStoredBytes: before?.storedBytes ?? 0,
-        afterStoredBytes: after?.storedBytes ?? 0,
-      });
+      jsonResponse(res, 200, { ownerId: ownerIdStr, ...result });
     } catch (e) {
       logger.emit("warn", "self.compact_owner_failed", {
         ownerId: ownerIdStr,
