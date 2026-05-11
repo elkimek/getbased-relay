@@ -16,11 +16,23 @@
 //                                    and zeroes evolu_usage.storedBytes.
 // GET  /self/owner-storage     query ?ownerId=...&timestamp=...&signature=...
 //                              auth  HMAC-SHA256(writeKey, "storage:{ownerId}:{timestamp}")
-//                              does  returns the relay's actual
-//                                    {storedBytes, quotaBytes} for the
-//                                    owner. Replaces the client's
-//                                    cumulative-bytes estimate (which
-//                                    drifts as soon as compaction runs).
+//                              does  returns the relay's actual state for
+//                                    the owner:
+//                                      storedBytes      — evolu_usage.storedBytes
+//                                      quotaBytes       — config per-owner cap
+//                                      messageCount     — # of evolu_message rows
+//                                      lastWriteToken   — hex of evolu_usage.lastTimestamp,
+//                                                         or null if no writes have landed
+//                                    Replaces the client's cumulative-bytes
+//                                    estimate (drifts after compaction)
+//                                    AND lets the client verify "is the
+//                                    relay actually persisting my pushes?"
+//                                    by polling lastWriteToken before/after
+//                                    a push — if storedBytes/messageCount
+//                                    don't advance and lastWriteToken
+//                                    doesn't change, the push was silently
+//                                    rejected (see Evolu silent-reject
+//                                    bug 2026-05-11).
 //
 // Replay defence: the timestamp must be within ±5 minutes of server time;
 // outside that window the request is rejected. Inside the window a captured
@@ -421,13 +433,42 @@ export function createSelfServer(
       const readDb = new Database(dbPath, { fileMustExist: true, readonly: true });
       try {
         readDb.pragma("busy_timeout = 5000");
-        const row = readDb
-          .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
-          .get(ownerId) as { storedBytes: number } | undefined;
+        // Read usage (storedBytes + lastTimestamp) + message count
+        // ATOMICALLY. better-sqlite3 runs each statement in its own
+        // implicit transaction, so without an explicit wrapper a writer
+        // can commit between the two SELECTs and we'd report inconsistent
+        // counts (storedBytes/messageCount referring to different DB
+        // snapshots) → could surface as a spurious 'wedged' verdict on
+        // the client. Wrapping both reads in a single transaction makes
+        // them observe the same snapshot. (Greptile follow-up on #12.)
+        const probe = readDb.transaction(() => {
+          const usageRow = readDb
+            .prepare(
+              'SELECT "storedBytes", "lastTimestamp" FROM evolu_usage WHERE "ownerId" = ?',
+            )
+            .get(ownerId) as
+            | { storedBytes: number; lastTimestamp: Buffer | null }
+            | undefined;
+          const msgRow = readDb
+            .prepare(
+              'SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?',
+            )
+            .get(ownerId) as { c: number } | undefined;
+          return { usageRow, msgRow };
+        });
+        const { usageRow, msgRow } = probe();
+        // Empty buffer (zero-length) means "no writes ever landed" —
+        // surface that as null so the client doesn't have to
+        // distinguish empty-string vs absent.
+        const lastTs = usageRow?.lastTimestamp;
+        const lastWriteToken =
+          lastTs && lastTs.length > 0 ? lastTs.toString("hex") : null;
         jsonResponse(res, 200, {
           ownerId: ownerIdStr,
-          storedBytes: row?.storedBytes ?? 0,
+          storedBytes: usageRow?.storedBytes ?? 0,
           quotaBytes: config.quotaPerOwnerBytes,
+          messageCount: msgRow?.c ?? 0,
+          lastWriteToken,
         });
       } finally {
         readDb.close();
