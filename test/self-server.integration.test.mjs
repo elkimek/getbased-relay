@@ -122,6 +122,15 @@ test("storage probe returns live storedBytes from the DB", async () => {
   assert.equal(body.ownerId, ownerIdStr);
   assert.equal(body.storedBytes, 5000, "should report the 5000 bytes we wrote");
   assert.equal(typeof body.quotaBytes, "number");
+  // Health-probe fields — let clients verify "is the relay actually
+  // persisting my pushes?" without SSH-ing into the DB. Seeded with 5
+  // message rows + lastTimestamp = "ts-4" in the before() hook.
+  assert.equal(body.messageCount, 5, "should reflect the 5 message rows we seeded");
+  assert.equal(
+    body.lastWriteToken,
+    Buffer.from("ts-4", "utf8").toString("hex"),
+    "should surface lastTimestamp as hex so clients can poll for progress",
+  );
 });
 
 test("storage probe rejects a swapped-context signature (replay across endpoints)", async () => {
@@ -201,6 +210,13 @@ test("storage probe still works after compact (returns 0)", async () => {
   assert.equal(r.status, 200);
   const body = await r.json();
   assert.equal(body.storedBytes, 0);
+  // Post-compact health fields — messageCount drops to 0 and
+  // lastWriteToken becomes null. This is the exact shape a wedged owner
+  // shows: storedBytes=0, messageCount=0, lastWriteToken=null. Combined
+  // with a recent client-side "Push committed" event, the client can
+  // conclude the relay is silently dropping pushes.
+  assert.equal(body.messageCount, 0, "no messages remain after compact");
+  assert.equal(body.lastWriteToken, null, "lastWriteToken should be null when no writes have landed");
 });
 
 test("rate limit fires at request 11 on compact (matches per-IP cap)", async () => {

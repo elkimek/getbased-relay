@@ -1,9 +1,11 @@
 {
   "name": "getbased-relay",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Self-hosted Evolu CRDT relay with structured logging, metrics, and quota management",
   "type": "module",
-  "engines": { "node": ">=22.0.0" },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
