@@ -1,12 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 
-let server, port, ownerId, writeKey, token, tokenHash;
+let server, port, ownerId, writeKey, token, tokenHash, dataDir, dbPath;
 
 function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
@@ -20,11 +20,11 @@ function signContext({ profileId = 'default', context, timestamp, tokenHash: has
 }
 
 before(async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'context-gateway-data-'));
+  dataDir = mkdtempSync(join(tmpdir(), 'context-gateway-data-'));
   const relayDir = mkdtempSync(join(tmpdir(), 'context-gateway-relay-'));
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(relayDir, { recursive: true });
-  const dbPath = join(relayDir, 'evolu-relay.db');
+  dbPath = join(relayDir, 'evolu-relay.db');
   const db = new Database(dbPath);
   db.exec(`
     CREATE TABLE evolu_writeKey (
@@ -153,4 +153,53 @@ test('owner token and profile limits are enforced', async () => {
   assert.equal(post3.status, 409);
   const body3 = await post3.json();
   assert.equal(body3.error, 'profile_limit_exceeded');
+});
+
+test('health endpoint works without token for docker healthchecks', async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { status: 'ok' });
+});
+
+test('malformed legacy context file returns 404 instead of crashing server', async () => {
+  const legacyToken = 'legacy-malformed-token';
+  const legacyPath = join(dataDir, Buffer.from(legacyToken).toString('base64url').slice(0, 32) + '.json');
+  writeFileSync(legacyPath, '{not-json');
+
+  const res = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    headers: { Authorization: `Bearer ${legacyToken}` },
+  });
+  assert.equal(res.status, 404);
+  assert.equal((await res.json()).error, 'No context found for this token');
+
+  const health = await fetch(`http://127.0.0.1:${port}/health`);
+  assert.equal(health.status, 200);
+});
+
+test('write-key lookup follows a recreated Evolu DB file', async () => {
+  const ownerBytes = Buffer.from(ownerId, 'base64url');
+  const rotatedWriteKey = randomBytes(32);
+  rmSync(dbPath, { force: true });
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE evolu_writeKey (
+      "ownerId" blob not null,
+      "writeKey" blob not null,
+      primary key ("ownerId")
+    ) strict;
+  `);
+  db.prepare('INSERT INTO evolu_writeKey ("ownerId", "writeKey") VALUES (?, ?)').run(ownerBytes, rotatedWriteKey);
+  db.close();
+  writeKey = rotatedWriteKey;
+
+  const profileId = 'p1';
+  const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'rotated' } });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const res = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(res.status, 200);
 });

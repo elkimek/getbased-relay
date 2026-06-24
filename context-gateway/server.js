@@ -15,7 +15,7 @@ import Database from 'better-sqlite3';
 const DATA_DIR = process.env.CONTEXT_DATA_DIR || '/opt/context-gateway/data';
 const EVOLU_DB_PATH = process.env.EVOLU_DB_PATH || '/data/evolu-relay.db';
 const PORT = Number(process.env.CONTEXT_PORT || 4001);
-const BIND = process.env.CONTEXT_BIND || '0.0.0.0';
+const BIND = process.env.CONTEXT_BIND || '127.0.0.1';
 const MAX_CONTEXT_BYTES = Number(process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES || 512 * 1024);
 const OWNER_QUOTA_BYTES = Number(process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES || 5 * 1024 * 1024);
 const MAX_PROFILES_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_PROFILES || 20);
@@ -100,17 +100,19 @@ function safeEqualHex(aHex, bBuffer) {
   return timingSafeEqual(a, bBuffer);
 }
 
-let lookupDb = null;
 function lookupWriteKey(ownerBytes) {
   if (!existsSync(EVOLU_DB_PATH)) return null;
-  if (!lookupDb) {
-    lookupDb = new Database(EVOLU_DB_PATH, { fileMustExist: true, readonly: true });
-    lookupDb.pragma('busy_timeout = 5000');
+  let db;
+  try {
+    db = new Database(EVOLU_DB_PATH, { fileMustExist: true, readonly: true });
+    db.pragma('busy_timeout = 5000');
+    const row = db
+      .prepare('SELECT "writeKey" FROM evolu_writeKey WHERE "ownerId" = ?')
+      .get(ownerBytes);
+    return row?.writeKey ?? null;
+  } finally {
+    try { db?.close(); } catch {}
   }
-  const row = lookupDb
-    .prepare('SELECT "writeKey" FROM evolu_writeKey WHERE "ownerId" = ?')
-    .get(ownerBytes);
-  return row?.writeKey ?? null;
 }
 
 function verifyOwnerSignature({ ownerId, timestamp, signature, tokenHash, profileId, context }) {
@@ -241,7 +243,11 @@ function handleGetContext(req, res, token, tokenHash, url) {
       json(res, 404, { error: 'No context found for this token' });
       return;
     }
-    const stored = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    const stored = safeReadJson(legacyPath, null);
+    if (!stored) {
+      json(res, 404, { error: 'No context found for this token' });
+      return;
+    }
     json(res, 200, stored);
     return;
   }
@@ -316,13 +322,18 @@ const server = createServer((req, res) => {
     return;
   }
 
+  const url = new URL(req.url, 'http://localhost');
+  if (req.method === 'GET' && url.pathname === '/health') {
+    json(res, 200, { status: 'ok' });
+    return;
+  }
+
   const token = authToken(req);
   if (!token) {
     json(res, 401, { error: 'Missing or invalid token' });
     return;
   }
   const tokenHash = sha256Hex(token);
-  const url = new URL(req.url, 'http://localhost');
 
   if (req.method === 'POST' && url.pathname === '/api/context') {
     void handlePostContext(req, res, token, tokenHash);
