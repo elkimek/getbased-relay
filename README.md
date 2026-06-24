@@ -149,21 +149,31 @@ The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxie
 
 ## Context Gateway
 
-A simple HTTP API that stores per-profile lab context behind token auth. MCP servers and bot plugins use it to query health data on behalf of messenger/bot interfaces. Runs alongside the Evolu relay as a separate service.
+HTTP API for Agent Access. MCP servers and bot plugins use it to fetch the browser-rendered lab context on behalf of messenger/bot interfaces. Runs alongside the Evolu relay as a separate service.
 
 ### How it works
 
-Each authenticated token gets a JSON file in `/opt/context-gateway/data/` (filename is a hash of the token). Context is stored per-profile, so multiple profiles can coexist under the same token. The format is backward-compatible with the old single-context layout — existing files are migrated on first write.
+Agent Access storage is owner-bound, not token-bound:
+
+- the browser encrypts context locally before upload;
+- the bearer token is only a read capability;
+- every write is HMAC-signed with the Evolu owner's `writeKey`;
+- the gateway looks up that write key in the relay SQLite DB and stores context under `/owners/<ownerId>.json`;
+- token hashes map to owner IDs in `agent-token-map.json`;
+- per-owner limits cap profiles, active tokens, per-profile payload size, and total Agent Access storage.
+
+This prevents users from bypassing relay quota by generating unlimited random Agent Access tokens. Legacy token-hash files remain readable during rollout, but new writes require owner proof.
 
 ### Endpoints
 
-All endpoints require `Authorization: Bearer <token>`.
+All endpoints require `Authorization: Bearer <agent-access-token>`.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST /api/context` | — | Push context. Body: `{ context, profileId, profiles }` |
-| `GET /api/context` | — | Get the default profile's context |
-| `GET /api/context?profile=<id>` | — | Get a specific profile's context |
+| `POST /api/context` | — | Push encrypted context. Body: `{ ownerId, timestamp, signature, context, profileId }`. Signature is `HMAC-SHA256(writeKey, "agent-context:{ownerId}:{timestamp}:{sha256(token)}:{profileId}:{sha256(context)}")`. |
+| `GET /api/context` | — | Get the default profile's encrypted context for this token's owner mapping |
+| `GET /api/context?profile=<id>` | — | Get a specific profile's encrypted context |
+| `DELETE /api/context` | — | Revoke this token's owner mapping, signed with the same owner proof over an empty context |
 
 ### Docker Compose
 
