@@ -1,0 +1,156 @@
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHmac, createHash, randomBytes } from 'node:crypto';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import Database from 'better-sqlite3';
+
+let server, port, ownerId, writeKey, token, tokenHash;
+
+function sha256Hex(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function signContext({ profileId = 'default', context, timestamp, tokenHash: hash = tokenHash }) {
+  const contextHash = sha256Hex(context);
+  return createHmac('sha256', writeKey)
+    .update(`agent-context:${ownerId}:${timestamp}:${hash}:${profileId}:${contextHash}`)
+    .digest('hex');
+}
+
+before(async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'context-gateway-data-'));
+  const relayDir = mkdtempSync(join(tmpdir(), 'context-gateway-relay-'));
+  mkdirSync(dataDir, { recursive: true });
+  mkdirSync(relayDir, { recursive: true });
+  const dbPath = join(relayDir, 'evolu-relay.db');
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE evolu_writeKey (
+      "ownerId" blob not null,
+      "writeKey" blob not null,
+      primary key ("ownerId")
+    ) strict;
+  `);
+  const ownerBytes = randomBytes(16);
+  ownerId = ownerBytes.toString('base64url');
+  writeKey = randomBytes(32);
+  db.prepare('INSERT INTO evolu_writeKey ("ownerId", "writeKey") VALUES (?, ?)').run(ownerBytes, writeKey);
+  db.close();
+
+  token = 'a'.repeat(64);
+  tokenHash = sha256Hex(token);
+  port = 15000 + Math.floor(Math.random() * 1000);
+  process.env.CONTEXT_DATA_DIR = dataDir;
+  process.env.EVOLU_DB_PATH = dbPath;
+  process.env.CONTEXT_PORT = String(port);
+  process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES = '2000';
+  process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
+  process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
+  process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
+  ({ server } = await import('../context-gateway/server.js?test=' + Date.now()));
+  await new Promise((resolve, reject) => {
+    server.listen(port, '127.0.0.1', resolve);
+    server.on('error', reject);
+  });
+});
+
+after(async () => {
+  if (server?.listening) await new Promise(resolve => server.close(resolve));
+});
+
+test('owner-bound context POST stores under owner, not raw token namespace', async () => {
+  const profileId = 'p1';
+  const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'abc' } });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const post = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(post.status, 200);
+  const postBody = await post.json();
+  assert.equal(postBody.ownerId, ownerId);
+  assert.equal(typeof postBody.ownerBytes, 'number');
+
+  const get = await fetch(`http://127.0.0.1:${port}/api/context?profile=p1`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(get.status, 200);
+  const body = await get.json();
+  assert.equal(body.profileId, 'p1');
+  assert.equal(body.context, context);
+});
+
+test('wrong owner signature is rejected and creates no token mapping', async () => {
+  const badToken = 'b'.repeat(64);
+  const profileId = 'bad';
+  const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'bad' } });
+  const timestamp = Date.now();
+  const wrongHash = sha256Hex(badToken);
+  const signature = signContext({ profileId, context, timestamp, tokenHash: '0'.repeat(64) });
+  assert.notEqual(wrongHash, '0'.repeat(64));
+  const post = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${badToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(post.status, 401);
+
+  const get = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    headers: { Authorization: `Bearer ${badToken}` },
+  });
+  assert.equal(get.status, 404);
+});
+
+test('owner token and profile limits are enforced', async () => {
+  const token2 = 'c'.repeat(64);
+  const token3 = 'd'.repeat(64);
+  for (const [tok, profileId] of [[token2, 'p2']]) {
+    const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: profileId } });
+    const timestamp = Date.now();
+    const signature = signContext({ profileId, context, timestamp, tokenHash: sha256Hex(tok) });
+    const post = await fetch(`http://127.0.0.1:${port}/api/context`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+    });
+    assert.equal(post.status, 200);
+  }
+
+  const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'p3' } });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId: 'p3', context, timestamp, tokenHash: sha256Hex(token3) });
+  const post = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token3}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId: 'p3', context, timestamp, signature }),
+  });
+  assert.equal(post.status, 409);
+  const body = await post.json();
+  assert.equal(body.error, 'token_limit_exceeded');
+
+  const context2 = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'p3' } });
+  const timestamp2 = Date.now();
+  const signature2 = signContext({ profileId: 'p3', context: context2, timestamp: timestamp2, tokenHash: sha256Hex(token2) });
+  const post2 = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token2}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId: 'p3', context: context2, timestamp: timestamp2, signature: signature2 }),
+  });
+  assert.equal(post2.status, 200);
+
+  const context3 = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'p4' } });
+  const timestamp3 = Date.now();
+  const signature3 = signContext({ profileId: 'p4', context: context3, timestamp: timestamp3, tokenHash: sha256Hex(token2) });
+  const post3 = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token2}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId: 'p4', context: context3, timestamp: timestamp3, signature: signature3 }),
+  });
+  assert.equal(post3.status, 409);
+  const body3 = await post3.json();
+  assert.equal(body3.error, 'profile_limit_exceeded');
+});

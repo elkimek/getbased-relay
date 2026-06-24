@@ -32,6 +32,13 @@ services:
       - "4001:4001"
     volumes:
       - context-data:/opt/context-gateway/data
+      - relay-data:/data:ro
+    environment:
+      - EVOLU_DB_PATH=/data/evolu-relay.db
+      - AGENT_CONTEXT_OWNER_QUOTA_BYTES=5242880
+      - AGENT_CONTEXT_MAX_PROFILE_BYTES=524288
+      - AGENT_CONTEXT_MAX_PROFILES=20
+      - AGENT_CONTEXT_MAX_TOKENS=3
     restart: unless-stopped
 
 volumes:
