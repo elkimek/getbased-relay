@@ -29,7 +29,10 @@ services:
   context-gateway:
     build: ./context-gateway
     ports:
-      - "4001:4001"
+      # Bind the host side to loopback; Caddy/reverse proxy should be the
+      # only public entrypoint. CONTEXT_BIND remains 0.0.0.0 so Docker can
+      # reach the service inside the container network.
+      - "127.0.0.1:4001:4001"
     volumes:
       - context-data:/opt/context-gateway/data
       - relay-data:/data:ro
