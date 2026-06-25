@@ -1,6 +1,6 @@
 # getbased-relay
 
-Self-hosted [Evolu](https://github.com/evoluhq/evolu) CRDT relay with structured logging, metrics, and quota management.
+Self-hosted [Evolu](https://github.com/evoluhq/evolu) CRDT relay for getbased sync, with structured logging, metrics, quota management, owner self-service endpoints, and the optional Agent Access context gateway.
 
 Wraps [`@evolu/nodejs`](https://www.npmjs.com/package/@evolu/nodejs) — all sync protocol and CRDT logic is from Evolu. This project adds the operational layer for running a relay in production.
 
@@ -79,8 +79,8 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 **Admin port** (default 4001, localhost only) — HTTP endpoints:
 
 - `GET /health` — Always public. Returns `{"status":"ok","uptime":...}`
-- `GET /metrics` — Requires `Authorization: Bearer <ADMIN_TOKEN>` if configured. Returns owner count, per-owner storage, DB size, connection count, quota settings.
-- `POST /compact-owner?ownerId=<base64url-22-char>` — Requires `Authorization: Bearer <ADMIN_TOKEN>`. Drops every `evolu_message` row for the given owner and resets `evolu_usage.storedBytes` to 0. Use when an owner has hit the per-owner quota (`quota.owner_exceeded` warnings) — the running counter never decrements on its own (Evolu has no built-in compaction). Clients keep their full state in localStorage; the next push from each device re-establishes the owner's CRDT state on the relay. Response body: `{ownerId, deletedMessages, beforeStoredBytes, afterStoredBytes}`.
+- `GET /metrics` — Requires the admin bearer token when `ADMIN_TOKEN` is configured. Returns owner count, per-owner storage, DB size, connection count, and quota settings.
+- `POST /compact-owner?ownerId=<base64url-22-char>` — Requires the admin bearer token. Drops every `evolu_message` row for the given owner and resets `evolu_usage.storedBytes` to 0. Use when an owner has hit the per-owner quota (`quota.owner_exceeded` warnings). Clients keep their full state in localStorage; the next push from each device re-establishes the owner's CRDT state on the relay. Response body: `{ownerId, deletedMessages, beforeStoredBytes, afterStoredBytes}`.
 
 **Self-service port** (default 4003) — owner-scoped HTTP endpoints, signed with the client's own writeKey. No admin token; one user can never act on another user's owner. Intended to be exposed via the same reverse proxy as the relay port.
 
@@ -149,7 +149,7 @@ The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxie
 
 ## Context Gateway
 
-HTTP API for Agent Access. MCP servers and bot plugins use it to fetch the browser-rendered lab context on behalf of messenger/bot interfaces. Runs alongside the Evolu relay as a separate service.
+HTTP API for Agent Access. MCP servers and bot plugins use it to fetch encrypted, browser-rendered getbased context for an external AI assistant. Runs alongside the Evolu relay as a separate service.
 
 ### How it works
 
@@ -166,7 +166,7 @@ This prevents users from bypassing relay quota by generating unlimited random Ag
 
 ### Endpoints
 
-All endpoints require `Authorization: Bearer <agent-access-token>`.
+All endpoints require an Agent Access bearer token in the `Authorization` header.
 
 | Method | Path | Description |
 |---|---|---|
