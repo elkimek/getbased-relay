@@ -2,8 +2,7 @@
 //
 // Validates the full pipeline that the production smoke tests can't:
 //   - HMAC signed by client + verified by server over real HTTP
-//   - DB transaction actually drops evolu_message rows + zeroes
-//     evolu_usage.storedBytes
+//   - DB transaction drops evolu_message rows + removes evolu_usage
 //   - Storage probe returns the live storedBytes value
 //   - Rate limiter fires at the configured cap
 //
@@ -142,7 +141,7 @@ test("storage probe rejects a swapped-context signature (replay across endpoints
   assert.equal(r.status, 401);
 });
 
-test("compact drops every evolu_message row and zeroes storedBytes", async () => {
+test("compact drops every evolu_message row and removes usage", async () => {
   // Sanity: precondition.
   const db = new Database(dbPath, { readonly: true });
   const before = db.prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes);
@@ -183,9 +182,7 @@ test("compact drops every evolu_message row and zeroes storedBytes", async () =>
   // peers' fresh per-row pushes get rejected as "already have it" and
   // disappear. Verified in production 2026-05-06.
   assert.equal(afterTs.c, 0, "should have 0 timestamp/fingerprint rows after compact (else fresh pushes get stranded)");
-  assert.equal(afterUsage.storedBytes, 0, "should have 0 storedBytes after");
-  assert.equal(afterUsage.firstTimestamp, null, "firstTimestamp should be cleared (pointed at deleted messages)");
-  assert.equal(afterUsage.lastTimestamp, null, "lastTimestamp should be cleared (pointed at deleted messages)");
+  assert.equal(afterUsage, undefined, "empty owners must not retain a NULL-timestamp usage row");
 });
 
 test("compact is idempotent (second call returns deletedMessages=0)", async () => {
