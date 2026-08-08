@@ -12,6 +12,11 @@ updates:
         update-types:
           - patch
           - minor
+    ignore:
+      # Keep compile-time APIs aligned with CI and the production image.
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: github-actions
     directory: /
