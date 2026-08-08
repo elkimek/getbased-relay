@@ -22,9 +22,8 @@ export interface CompactOwnerResult {
  *    makes the relay report fingerprints for timestamps without payloads,
  *    so peers' subsequent per-row pushes get rejected as "you already have
  *    it" and silently disappear)
- *  - evolu_usage.storedBytes / firstTimestamp / lastTimestamp (zeroed so
- *    quota tracking matches reality and getOwnerUsage doesn't fall back
- *    to stale bookkeeping pointing at deleted message rows)
+ *  - evolu_usage row (deleted so Evolu's next write takes the fresh-owner
+ *    path and recreates valid non-null first/last timestamps)
  *
  * Caller passes an open `Database` handle with `busy_timeout` already set
  * to whatever they want (admin and self both use 30s). The transaction is
@@ -47,9 +46,9 @@ export function compactOwner(
     deletedMessages = cnt.c;
     db.prepare('DELETE FROM evolu_message WHERE "ownerId" = ?').run(ownerId);
     db.prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?').run(ownerId);
-    db.prepare(
-      'UPDATE evolu_usage SET "storedBytes" = 0, "firstTimestamp" = NULL, "lastTimestamp" = NULL WHERE "ownerId" = ?',
-    ).run(ownerId);
+    // An existing usage row with NULL timestamps makes Evolu reject rebuild
+    // writes with ProtocolInvalidDataError. No row is the empty-owner state.
+    db.prepare('DELETE FROM evolu_usage WHERE "ownerId" = ?').run(ownerId);
     after = db
       .prepare('SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?')
       .get(ownerId) as { storedBytes: number } | undefined;

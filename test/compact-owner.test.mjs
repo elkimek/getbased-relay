@@ -15,6 +15,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import { createRandom, createSqlite, SimpleName } from "@evolu/common";
+import {
+  createBaseSqliteStorageTables,
+  createRelaySqliteStorage,
+  createRelayStorageTables,
+} from "@evolu/common/local-first";
+import { createBetterSqliteDriver } from "@evolu/nodejs";
 
 import { compactOwner } from "../dist/lib/compact-owner.js";
 
@@ -58,6 +65,39 @@ function seedOwner(db, ownerIdBytes, { messageCount = 5, payloadBytes = 1000 } =
   }
 }
 
+async function openRealRelayStorage(dataDir, fresh) {
+  const createSqliteDriver = (name, options) => {
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dataDir);
+      return createBetterSqliteDriver(name, options);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  };
+  const opened = await createSqlite({ createSqliteDriver })(
+    SimpleName.orThrow("compact-owner-relay-test"),
+  );
+  assert.equal(opened.ok, true, "real Evolu SQLite storage should open");
+  const sqlite = opened.value;
+  if (fresh) {
+    const baseTables = createBaseSqliteStorageTables({ sqlite });
+    assert.equal(baseTables.ok, true, "base Evolu tables should be created");
+    const relayTables = createRelayStorageTables({ sqlite });
+    assert.equal(relayTables.ok, true, "relay Evolu tables should be created");
+  }
+  const storageErrors = [];
+  const storage = createRelaySqliteStorage({
+    random: createRandom(),
+    sqlite,
+    timingSafeEqual: (a, b) => Buffer.from(a).equals(Buffer.from(b)),
+  })({
+    onStorageError: (error) => storageErrors.push(error),
+    isOwnerWithinQuota: () => true,
+  });
+  return { sqlite, storage, storageErrors };
+}
+
 test("compactOwner deletes evolu_message rows for the target owner", () => {
   const { db } = setup();
   const ownerIdBytes = randomBytes(16);
@@ -87,7 +127,7 @@ test("compactOwner deletes evolu_timestamp rows (the merkle/fingerprint table)",
   assert.equal(after.c, 0, "evolu_timestamp must be empty post-compact (else fresh pushes get stranded)");
 });
 
-test("compactOwner zeroes storedBytes + clears first/lastTimestamp on evolu_usage", () => {
+test("compactOwner deletes evolu_usage so the next write takes the fresh-owner path", () => {
   const { db } = setup();
   const ownerIdBytes = randomBytes(16);
   seedOwner(db, ownerIdBytes);
@@ -97,9 +137,54 @@ test("compactOwner zeroes storedBytes + clears first/lastTimestamp on evolu_usag
   assert.equal(result.beforeStoredBytes, 5000);
   assert.equal(result.afterStoredBytes, 0);
   const usage = db.prepare('SELECT * FROM evolu_usage WHERE "ownerId" = ?').get(ownerIdBytes);
-  assert.equal(usage.storedBytes, 0);
-  assert.equal(usage.firstTimestamp, null, "firstTimestamp pointed at a deleted message");
-  assert.equal(usage.lastTimestamp, null, "lastTimestamp pointed at a deleted message");
+  assert.equal(usage, undefined, "an existing NULL-timestamp row makes Evolu reject rebuild writes");
+});
+
+test("the real Evolu relay accepts a fresh write after compaction", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "compact-owner-real-relay-"));
+  const dbPath = join(dataDir, "compact-owner-relay-test.db");
+  const ownerIdBytes = randomBytes(16);
+  const oldMessage = {
+    timestamp: { millis: 1_000, counter: 0, nodeId: "0011223344556677" },
+    change: Buffer.alloc(80),
+  };
+  const initial = await openRealRelayStorage(dataDir, true);
+  const initialWrite = await initial.storage.writeMessages(ownerIdBytes, [oldMessage]);
+  assert.equal(initialWrite.ok, true, "fixture write should succeed through Evolu storage");
+  assert.deepEqual(initial.storageErrors, []);
+  initial.sqlite[Symbol.dispose]();
+
+  const db = new Database(dbPath);
+  compactOwner(db, ownerIdBytes);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE name LIKE 'evolu_%compaction%'").get().c,
+    0,
+    "compaction must not install hidden persistence triggers",
+  );
+  db.close();
+
+  const rebuilt = await openRealRelayStorage(dataDir, false);
+  const freshMessage = {
+    timestamp: { millis: 2_000, counter: 0, nodeId: "0011223344556677" },
+    change: Buffer.alloc(17),
+  };
+  const rebuiltWrite = await rebuilt.storage.writeMessages(ownerIdBytes, [freshMessage]);
+  assert.equal(rebuiltWrite.ok, true, "fresh-owner write must not hit Evolu's non-null assertion");
+  assert.deepEqual(rebuilt.storageErrors, []);
+  rebuilt.sqlite[Symbol.dispose]();
+
+  const verify = new Database(dbPath, { readonly: true });
+  const usage = verify
+    .prepare('SELECT "storedBytes", "firstTimestamp", "lastTimestamp" FROM evolu_usage WHERE "ownerId" = ?')
+    .get(ownerIdBytes);
+  assert.equal(usage.storedBytes, 17);
+  assert.notEqual(usage.firstTimestamp, null);
+  assert.notEqual(usage.lastTimestamp, null);
+  assert.equal(
+    verify.prepare('SELECT COUNT(*) AS c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes).c,
+    1,
+  );
+  verify.close();
 });
 
 test("compactOwner is idempotent (deletedMessages=0 on already-empty owner)", () => {

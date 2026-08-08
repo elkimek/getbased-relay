@@ -13,7 +13,8 @@
 //                              auth  HMAC-SHA256(writeKey, "compact:{ownerId}:{timestamp}")
 //                              does  same as /admin/compact-owner: drops
 //                                    every evolu_message row for the owner
-//                                    and zeroes evolu_usage.storedBytes.
+//                                    and removes the evolu_usage row. Every
+//                                    paired client must discard old history.
 // GET  /self/owner-storage     query ?ownerId=...&timestamp=...&signature=...
 //                              auth  HMAC-SHA256(writeKey, "storage:{ownerId}:{timestamp}")
 //                              does  returns the relay's actual state for
@@ -37,8 +38,8 @@
 // Replay defence: the timestamp must be within ±5 minutes of server time;
 // outside that window the request is rejected. Inside the window a captured
 // signature can be replayed — accepted as the standard cost of a
-// stateless HMAC scheme. Compaction is idempotent (second call zeroes
-// already-zero bytes) and storage is read-only, so replay is harmless.
+// stateless HMAC scheme. Compaction is idempotent (a second call leaves the
+// owner empty) and storage is read-only, so replay is harmless.
 //
 // This server binds to 0.0.0.0 by default because it's intended to be
 // reachable from outside the host (typically via a reverse proxy like

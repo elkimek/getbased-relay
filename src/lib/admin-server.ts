@@ -2,10 +2,9 @@
 // /health — unauthenticated, for uptime monitors
 // /metrics — requires ADMIN_TOKEN if set, returns per-owner usage
 // /compact-owner — requires ADMIN_TOKEN, drops an owner's evolu_message log
-//                  and zeroes their evolu_usage.storedBytes counter so writes
-//                  resume after the per-owner quota is hit. Clients keep
-//                  full importedData in localStorage, so the next push from
-//                  each device repopulates the owner's state.
+//                  and usage row so writes resume after the per-owner quota
+//                  is hit. Every paired client must discard the old Evolu
+//                  history before one client rebuilds a fresh snapshot.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
@@ -62,13 +61,13 @@ export function createAdminServer(
   }
 
   // POST /compact-owner?ownerId=<base64url-22-char>
-  // Drops every evolu_message row for the given owner and resets
-  // evolu_usage.storedBytes to 0. Use when an owner has hit the per-owner
+  // Drops every evolu_message row for the given owner and removes its
+  // evolu_usage row. Use when an owner has hit the per-owner
   // quota: the running counter never decrements on its own (Evolu has no
   // built-in compaction), so once a long-lived owner crosses the limit
   // every push fails with quota.owner_exceeded until this is called.
-  // Clients keep their full state in localStorage; the next push from each
-  // device re-establishes the owner's CRDT state on the relay.
+  // This must be coordinated across every paired client. Any device retaining
+  // the old Evolu history can upload it again after the relay-side reset.
   function handleCompactOwner(
     req: IncomingMessage,
     res: ServerResponse,
