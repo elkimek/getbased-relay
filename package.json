@@ -13,7 +13,7 @@
     "test": "tsc && node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@evolu/common": "^7.4.0",
+    "@evolu/common": "^8.2.0",
     "@evolu/nodejs": "^2.4.0",
     "better-sqlite3": "^13.0.3"
   },
