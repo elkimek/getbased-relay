@@ -7,7 +7,7 @@
 // acknowledges exact replays without re-inserting their encrypted payloads.
 
 import Database from "better-sqlite3";
-import { isNonEmptyReadonlyArray, ok } from "@evolu/common";
+import { isNonEmptyArray, ok } from "@evolu/common";
 import {
   ownerIdBytesToOwnerId,
   timestampToTimestampBytes,
@@ -81,7 +81,7 @@ export function createCompactionReplayGuard(
 
   const guardedStorage: Storage = {
     ...storage,
-    writeMessages: (ownerIdBytes, messages) => {
+    writeMessages: (ownerIdBytes, messages) => async (run) => {
       const ownerId = ownerIdBytesToOwnerId(ownerIdBytes);
       return withOwnerWriteLock(ownerId, async () => {
         const accepted: EncryptedCrdtMessage[] = [];
@@ -104,14 +104,13 @@ export function createCompactionReplayGuard(
             acceptedMessages: accepted.length,
           });
         }
-        if (!isNonEmptyReadonlyArray(accepted)) return ok();
-        return storage.writeMessages(ownerIdBytes, accepted);
+        if (!isNonEmptyArray(accepted)) return ok();
+        return await run(storage.writeMessages(ownerIdBytes, accepted));
       });
     },
     deleteOwner: (ownerIdBytes: OwnerIdBytes) => {
-      const deleted = storage.deleteOwner(ownerIdBytes);
-      if (deleted) deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
-      return deleted;
+      storage.deleteOwner(ownerIdBytes);
+      deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
     },
   };
 

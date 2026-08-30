@@ -2,7 +2,9 @@
 // Wraps @evolu/nodejs with structured logging, metrics, and quota management
 
 import { mkdirSync } from "fs";
-import { SimpleName } from "@evolu/common";
+import { createRun, Name } from "@evolu/common";
+import { installPolyfills } from "@evolu/common/polyfills";
+import { createRelayDeps } from "@evolu/nodejs";
 import { loadConfig } from "./lib/config.js";
 import { createLogger } from "./lib/logger.js";
 import { createQuotaChecker } from "./lib/quota.js";
@@ -13,6 +15,8 @@ import { createSelfServer } from "./lib/self-server.js";
 import { runStartupChecks } from "./lib/startup-check.js";
 import { createReplayProtectedRelay } from "./lib/replay-protected-relay.js";
 import { createContextVerifierServer } from "./lib/context-verifier-server.js";
+
+installPolyfills();
 
 // ─── Config ────────────────────────────────────────────
 const config = loadConfig();
@@ -60,20 +64,21 @@ logger.setOwnerCallback((ownerId: string) =>
 );
 
 // ─── Evolu relay ──────────────────────────────────────
-// Evolu's Console type is not publicly exported — cast required.
-// Our console implements the full interface (log/warn/error/debug + enabled property).
-const relay = await createReplayProtectedRelay({
-  console: logger.console as never,
+const relayRun = createRun({
+  ...createRelayDeps(),
+  console: logger.console,
   logger,
-})({
+});
+const relay = await relayRun.abortable(createReplayProtectedRelay({
   port: config.relayPort,
-  name: SimpleName.orThrow(config.relayName),
+  name: Name.orThrow(config.relayName),
   enableLogging: config.enableEvoluLogging,
   isOwnerWithinQuota,
-});
+}));
 
 if (!relay.ok) {
   logger.emit("error", "relay.failed", { error: relay.error as unknown as Record<string, unknown> });
+  await relayRun[Symbol.asyncDispose]();
   process.exit(1);
 }
 
@@ -111,7 +116,8 @@ async function shutdown(signal: string): Promise<void> {
   ownerTracker.stop();
   metrics.close();
   try {
-    if ("value" in relay) relay.value[Symbol.dispose]();
+    if ("value" in relay) await relay.value[Symbol.asyncDispose]();
+    await relayRun[Symbol.asyncDispose]();
   } catch (e) {
     logger.emit("warn", "relay.dispose_error", { error: (e as Error).message });
   }
