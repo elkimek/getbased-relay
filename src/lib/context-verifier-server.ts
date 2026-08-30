@@ -164,11 +164,11 @@ export function createContextVerifierServer(
       json(res, 401, { ok: false });
       return;
     }
-    if (req.method === "POST" && req.url === "/verify-agent-context") {
-      void handleVerify(req, res);
-      return;
-    }
-    json(res, 404, { ok: false });
+    // This is a single-purpose authenticated Unix-socket service, not a
+    // general HTTP router. Dispatch every authenticated request to the same
+    // read-only verifier; malformed or body-less requests fail JSON/proof
+    // validation without reaching a second operation.
+    void handleVerify(req, res);
   });
 
   server.headersTimeout = 5000;
