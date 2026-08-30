@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -23,7 +24,9 @@ const MAX_PROFILES_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_PROFILES || 
 const MAX_TOKENS_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_TOKENS || 3);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
-const TRUST_PROXY = /^(1|true)$/i.test(process.env.CONTEXT_TRUST_PROXY || '');
+const CLIENT_IP_HEADER = /^[a-z0-9-]+$/i.test(process.env.CONTEXT_CLIENT_IP_HEADER || '')
+  ? process.env.CONTEXT_CLIENT_IP_HEADER.toLowerCase()
+  : '';
 const rateBuckets = new Map();
 
 mkdirSync(DATA_DIR, { recursive: true });
@@ -163,12 +166,10 @@ function verifyOverSocket(payload) {
 }
 
 function requestIp(req) {
-  if (TRUST_PROXY) {
-    const forwarded = req.headers['x-forwarded-for'];
-    const first = Array.isArray(forwarded) ? forwarded[0] : String(forwarded || '').split(',')[0];
-    if (first?.trim()) return first.trim().slice(0, 64);
-  }
-  return String(req.socket.remoteAddress || 'unknown').slice(0, 64);
+  const peer = String(req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+  const supplied = CLIENT_IP_HEADER ? req.headers[CLIENT_IP_HEADER] : '';
+  const candidate = Array.isArray(supplied) ? supplied[0] : String(supplied || '');
+  return isIP(candidate.trim()) ? candidate.trim() : (isIP(peer) ? peer : 'unknown');
 }
 
 function rateCheck(req) {
@@ -452,4 +453,5 @@ export {
   server,
   sha256Hex,
   verifyOwnerSignature,
+  requestIp,
 };

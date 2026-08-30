@@ -56,7 +56,9 @@ services:
       - CONTEXT_BIND=0.0.0.0
       - CONTEXT_VERIFIER_SOCKET=/run/getbased-verifier/verifier.sock
       - CONTEXT_VERIFIER_TOKEN=${CONTEXT_VERIFIER_TOKEN:?set CONTEXT_VERIFIER_TOKEN in .env}
-      - CONTEXT_TRUST_PROXY=true
+      # Caddy overwrites this dedicated header from the socket peer. Ordinary
+      # X-Forwarded-For is ignored so callers cannot mint rate-limit buckets.
+      - CONTEXT_CLIENT_IP_HEADER=x-getbased-client-ip
       - CONTEXT_RATE_LIMIT_PER_MINUTE=300
       - AGENT_CONTEXT_OWNER_QUOTA_BYTES=5242880
       - AGENT_CONTEXT_MAX_PROFILE_BYTES=524288

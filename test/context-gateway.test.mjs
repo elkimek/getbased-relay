@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-let server, verifierServer, port, ownerId, writeKey, token, tokenHash, dataDir;
+let server, verifierServer, requestIp, port, ownerId, writeKey, token, tokenHash, dataDir;
 
 function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
@@ -51,12 +51,13 @@ before(async () => {
   process.env.CONTEXT_DATA_DIR = dataDir;
   process.env.CONTEXT_VERIFIER_SOCKET = verifierSocket;
   process.env.CONTEXT_VERIFIER_TOKEN = 'verifier-test-token';
+  process.env.CONTEXT_CLIENT_IP_HEADER = 'x-getbased-client-ip';
   process.env.CONTEXT_PORT = String(port);
   process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES = '2000';
   process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
-  ({ server } = await import('../context-gateway/server.js?test=' + Date.now()));
+  ({ server, requestIp } = await import('../context-gateway/server.js?test=' + Date.now()));
   await new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', resolve);
     server.on('error', reject);
@@ -167,6 +168,19 @@ test('health endpoint works without token for docker healthchecks', async () => 
   const res = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { status: 'ok' });
+});
+
+test('rate-limit identity ignores X-Forwarded-For and validates the dedicated header', () => {
+  const req = {
+    socket: { remoteAddress: '::ffff:172.18.0.1' },
+    headers: {
+      'x-forwarded-for': '198.51.100.99',
+      'x-getbased-client-ip': '203.0.113.7',
+    },
+  };
+  assert.equal(requestIp(req), '203.0.113.7');
+  req.headers['x-getbased-client-ip'] = '203.0.113.7, 198.51.100.1';
+  assert.equal(requestIp(req), '172.18.0.1');
 });
 
 test('malformed legacy context file returns 404 instead of crashing server', async () => {

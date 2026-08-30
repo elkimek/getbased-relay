@@ -177,6 +177,18 @@ separate `CONTEXT_VERIFIER_TOKEN`. Generate that deployment token with
 owner key. The public Agent Access protocol and browser HMAC format are
 unchanged.
 
+The supplied Context Gateway limiter keys on a dedicated
+`X-Getbased-Client-IP` header rather than `X-Forwarded-For`. The reverse proxy
+must overwrite it from the actual socket peer:
+
+```caddyfile
+handle /api/* {
+    reverse_proxy 127.0.0.1:4001 {
+        header_up X-Getbased-Client-IP {http.request.remote.host}
+    }
+}
+```
+
 ### Endpoints
 
 All endpoints require an Agent Access bearer token in the `Authorization` header.
