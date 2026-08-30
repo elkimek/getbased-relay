@@ -166,6 +166,7 @@ test("compact drops every evolu_message row and removes usage", async () => {
   const body = await r.json();
   assert.equal(body.ownerId, ownerIdStr);
   assert.equal(body.deletedMessages, 5);
+  assert.equal(body.protectedTimestamps, 5);
   assert.equal(body.beforeStoredBytes, 5000);
   assert.equal(body.afterStoredBytes, 0);
 

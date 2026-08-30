@@ -7,15 +7,23 @@
 // "already-seen" (see fix history at PR #10 for the production repro).
 
 import type Database from "better-sqlite3";
+import {
+  countCompactedTimestamps,
+  preserveCompactedTimestamps,
+} from "./compaction-replay.js";
 
 export interface CompactOwnerResult {
   deletedMessages: number;
+  protectedTimestamps: number;
   beforeStoredBytes: number;
   afterStoredBytes: number;
 }
 
 /**
- * Atomically drops every relay-side trace of `ownerId`:
+ * Atomically replaces the owner's encrypted history with compact replay
+ * tombstones, then drops its live Evolu state:
+ *  - getbased_compacted_timestamp rows retain only each deleted message's
+ *    16-byte timestamp so an offline replica cannot upload that payload again
  *  - evolu_message rows (the encrypted CRDT log)
  *  - evolu_timestamp rows (the merkle/fingerprint table feeding negentropy
  *    reconciliation — leaving these populated after evolu_message is gone
@@ -44,6 +52,7 @@ export function compactOwner(
       .prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?')
       .get(ownerId) as { c: number };
     deletedMessages = cnt.c;
+    preserveCompactedTimestamps(db, ownerId);
     db.prepare('DELETE FROM evolu_message WHERE "ownerId" = ?').run(ownerId);
     db.prepare('DELETE FROM evolu_timestamp WHERE "ownerId" = ?').run(ownerId);
     // An existing usage row with NULL timestamps makes Evolu reject rebuild
@@ -56,6 +65,7 @@ export function compactOwner(
   tx();
   return {
     deletedMessages,
+    protectedTimestamps: countCompactedTimestamps(db, ownerId),
     beforeStoredBytes: before?.storedBytes ?? 0,
     afterStoredBytes: after?.storedBytes ?? 0,
   };

@@ -1,10 +1,10 @@
 // Health and metrics HTTP endpoints on a separate port.
 // /health — unauthenticated, for uptime monitors
 // /metrics — requires ADMIN_TOKEN if set, returns per-owner usage
-// /compact-owner — requires ADMIN_TOKEN, drops an owner's evolu_message log
-//                  and usage row so writes resume after the per-owner quota
-//                  is hit. Every paired client must discard the old Evolu
-//                  history before one client rebuilds a fresh snapshot.
+// /compact-owner — requires ADMIN_TOKEN, replaces an owner's evolu_message log
+//                  with exact replay tombstones and clears live usage so
+//                  writes resume after quota. Stale paired devices may safely
+//                  reconnect after one client rebuilds a fresh snapshot.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { timingSafeEqual } from "crypto";
@@ -17,6 +17,7 @@ import type { Logger } from "./logger.js";
 import type { Metrics } from "./metrics.js";
 import type { OwnerTracker } from "./owner-tracker.js";
 import { compactOwner } from "./compact-owner.js";
+import { withOwnerWriteLock } from "./owner-write-lock.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(
@@ -66,13 +67,13 @@ export function createAdminServer(
   // quota: the running counter never decrements on its own (Evolu has no
   // built-in compaction), so once a long-lived owner crosses the limit
   // every push fails with quota.owner_exceeded until this is called.
-  // This must be coordinated across every paired client. Any device retaining
-  // the old Evolu history can upload it again after the relay-side reset.
-  function handleCompactOwner(
+  // Deleted message timestamps become replay tombstones, so a stale paired
+  // client cannot upload the discarded encrypted history again.
+  async function handleCompactOwner(
     req: IncomingMessage,
     res: ServerResponse,
     url: URL,
-  ): void {
+  ): Promise<void> {
     const ownerIdStr = url.searchParams.get("ownerId");
     if (!ownerIdStr || ownerIdStr.length !== 22) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -97,17 +98,18 @@ export function createAdminServer(
       return;
     }
     const dbPath = join(config.dataDir, `${config.relayName}.db`);
-    let db: Database.Database | null = null;
     try {
-      db = new Database(dbPath, { fileMustExist: true });
-      // Wait up to 30s for the relay's own writer to release the WAL lock
-      // before failing. better-sqlite3 defaults to a 5s busy_timeout, which
-      // is too short for a busy relay where the writer holds the lock during
-      // a large batch ingest.
-      db.pragma("busy_timeout = 30000");
-      // Shared transaction with /self/compact-owner — single source of
-      // truth for what "compact this owner" means (see compact-owner.ts).
-      const result = compactOwner(db, ownerId);
+      const result = await withOwnerWriteLock(ownerIdStr, () => {
+        const db = new Database(dbPath, { fileMustExist: true });
+        try {
+          // Wait up to 30s for unrelated SQLite writers. Same-owner relay
+          // writes are also serialized by the outer owner lock.
+          db.pragma("busy_timeout = 30000");
+          return compactOwner(db, ownerId);
+        } finally {
+          db.close();
+        }
+      });
       logger.emit("info", "admin.compact_owner", {
         ownerId: ownerIdStr,
         ...result,
@@ -123,10 +125,6 @@ export function createAdminServer(
       // path) over the wire — keep the detail in the structured log only.
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "compact_failed" }));
-    } finally {
-      try {
-        db?.close();
-      } catch {}
     }
   }
 
@@ -196,7 +194,8 @@ export function createAdminServer(
         );
         return;
       }
-      return handleCompactOwner(req, res, url);
+      void handleCompactOwner(req, res, url);
+      return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });

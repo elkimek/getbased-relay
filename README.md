@@ -80,11 +80,11 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 
 - `GET /health` — Always public. Returns `{"status":"ok","uptime":...}`
 - `GET /metrics` — Requires the admin bearer token when `ADMIN_TOKEN` is configured. Returns owner count, per-owner storage, DB size, connection count, and quota settings.
-- `POST /compact-owner?ownerId=<base64url-22-char>` — Requires the admin bearer token. Drops every relay message and the usage row for the owner. Use when an owner has hit the per-owner quota (`quota.owner_exceeded` warnings). This is a coordinated reset: stop and reset every paired client first, then rebuild one fresh snapshot from canonical application storage. Any client retaining the old Evolu history can upload it again. Response body: `{ownerId, deletedMessages, beforeStoredBytes, afterStoredBytes}`.
+- `POST /compact-owner?ownerId=<base64url-22-char>` — Requires the admin bearer token. Replaces every relay message with a small exact-timestamp replay tombstone and clears the owner's live usage. A stale or offline paired client can reconnect safely: replayed history is acknowledged but not stored, while timestamps the relay has never compacted remain valid new writes. Response body: `{ownerId, deletedMessages, protectedTimestamps, beforeStoredBytes, afterStoredBytes}`.
 
 **Self-service port** (default 4003) — owner-scoped HTTP endpoints, signed with the client's own writeKey. No admin token; one user can never act on another user's owner. Intended to be exposed via the same reverse proxy as the relay port.
 
-- `POST /self/compact-owner` — Body: `{ownerId, timestamp, signature}`. Same coordinated-reset requirement as `/compact-owner`, but client-driven; every paired client must discard its old Evolu history before one client rebuilds a fresh snapshot.
+- `POST /self/compact-owner` — Body: `{ownerId, timestamp, signature}`. Same replay-protected compaction as `/compact-owner`, but client-driven. Sync each device's latest changes first so the chosen canonical device has current application data; offline devices no longer need to discard their local Evolu history before reconnecting.
 - `GET /self/owner-storage?ownerId=...&timestamp=...&signature=...` — Returns `{ownerId, storedBytes, quotaBytes}` straight from `evolu_usage` for that owner. Use this to show users an accurate quota readout instead of a cumulative client-side estimate (which drifts the moment compaction runs).
 
 **Auth scheme.** `signature = HMAC-SHA256(writeKey, "{context}:{ownerId}:{timestamp}").hex()` where `context` is `"compact"` or `"storage"`. The relay looks up the writeKey in its `evolu_writeKey` table (the same secret the Evolu client already holds for pushes), recomputes the HMAC, and timing-safe-compares. The timestamp must be within ±5 minutes of server time. All auth failures return a uniform `401 unauthorized` to avoid an owner-existence oracle.
@@ -142,6 +142,8 @@ The admin port binds to `127.0.0.1` — access it via SSH tunnel or add a proxie
 - **src/lib/config.ts** — Env var parsing with defaults and typed `RelayConfig` interface
 - **src/lib/logger.ts** — Custom Console that intercepts Evolu's 17 relay events, emits structured JSON at configurable levels
 - **src/lib/quota.ts** — Per-owner + global disk quota via `isOwnerWithinQuota` callback
+- **src/lib/compaction-replay.ts** — Exact-timestamp tombstones that prevent stale devices from refilling compacted relay history
+- **src/lib/replay-protected-relay.ts** — Evolu Node/WebSocket adapter with the replay-filtered storage wrapper
 - **src/lib/owner-tracker.ts** — Last-seen tracking via relay subscribe events, persisted to sidecar file
 - **src/lib/metrics.ts** — Read-only SQLite queries against the relay DB
 - **src/lib/admin-server.ts** — HTTP server for `/health` and `/metrics`, timing-safe token auth

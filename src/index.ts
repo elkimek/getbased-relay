@@ -2,7 +2,6 @@
 // Wraps @evolu/nodejs with structured logging, metrics, and quota management
 
 import { mkdirSync } from "fs";
-import { createNodeJsRelay } from "@evolu/nodejs";
 import { SimpleName } from "@evolu/common";
 import { loadConfig } from "./lib/config.js";
 import { createLogger } from "./lib/logger.js";
@@ -12,6 +11,7 @@ import { createMetrics } from "./lib/metrics.js";
 import { createAdminServer } from "./lib/admin-server.js";
 import { createSelfServer } from "./lib/self-server.js";
 import { runStartupChecks } from "./lib/startup-check.js";
+import { createReplayProtectedRelay } from "./lib/replay-protected-relay.js";
 
 // ─── Config ────────────────────────────────────────────
 const config = loadConfig();
@@ -58,8 +58,9 @@ logger.setOwnerCallback((ownerId: string) =>
 // ─── Evolu relay ──────────────────────────────────────
 // Evolu's Console type is not publicly exported — cast required.
 // Our console implements the full interface (log/warn/error/debug + enabled property).
-const relay = await createNodeJsRelay({
+const relay = await createReplayProtectedRelay({
   console: logger.console as never,
+  logger,
 })({
   port: config.relayPort,
   name: SimpleName.orThrow(config.relayName),
