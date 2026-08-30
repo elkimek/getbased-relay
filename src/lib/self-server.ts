@@ -11,10 +11,10 @@
 // ─────────
 // POST /self/compact-owner     body  {ownerId, timestamp, signature}
 //                              auth  HMAC-SHA256(writeKey, "compact:{ownerId}:{timestamp}")
-//                              does  same as /admin/compact-owner: drops
-//                                    every evolu_message row for the owner
-//                                    and removes the evolu_usage row. Every
-//                                    paired client must discard old history.
+//                              does  same as /admin/compact-owner: replaces
+//                                    every relay message with a compact replay
+//                                    tombstone and clears live usage. Stale
+//                                    paired clients cannot restore old history.
 // GET  /self/owner-storage     query ?ownerId=...&timestamp=...&signature=...
 //                              auth  HMAC-SHA256(writeKey, "storage:{ownerId}:{timestamp}")
 //                              does  returns the relay's actual state for
@@ -52,6 +52,7 @@ import Database from "better-sqlite3";
 import type { RelayConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 import { compactOwner } from "./compact-owner.js";
+import { withOwnerWriteLock } from "./owner-write-lock.js";
 
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const MAX_BODY_BYTES = 4096;
@@ -369,11 +370,16 @@ export function createSelfServer(
     // Open a fresh write-handle so we don't hold the lookup-DB hostage
     // during the WAL wait.
     const dbPath = join(config.dataDir, `${config.relayName}.db`);
-    let db: Database.Database | null = null;
     try {
-      db = new Database(dbPath, { fileMustExist: true });
-      db.pragma("busy_timeout = 30000");
-      const result = compactOwner(db, ownerId);
+      const result = await withOwnerWriteLock(ownerIdStr, () => {
+        const db = new Database(dbPath, { fileMustExist: true });
+        try {
+          db.pragma("busy_timeout = 30000");
+          return compactOwner(db, ownerId);
+        } finally {
+          db.close();
+        }
+      });
       logger.emit("info", "self.compact_owner", {
         ownerId: ownerIdStr,
         ...result,
@@ -385,8 +391,6 @@ export function createSelfServer(
         error: (e as Error).message,
       });
       jsonResponse(res, 500, { error: "compact_failed" });
-    } finally {
-      try { db?.close(); } catch {}
     }
   }
 

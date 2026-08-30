@@ -24,6 +24,7 @@ import {
 import { createBetterSqliteDriver } from "@evolu/nodejs";
 
 import { compactOwner } from "../dist/lib/compact-owner.js";
+import { createCompactionReplayGuard } from "../dist/lib/compaction-replay.js";
 
 function setup() {
   const dbPath = join(mkdtempSync(join(tmpdir(), "compact-owner-test-")), "relay.db");
@@ -66,6 +67,7 @@ function seedOwner(db, ownerIdBytes, { messageCount = 5, payloadBytes = 1000 } =
 }
 
 async function openRealRelayStorage(dataDir, fresh) {
+  const dbPath = join(dataDir, "compact-owner-relay-test.db");
   const createSqliteDriver = (name, options) => {
     const previousCwd = process.cwd();
     try {
@@ -87,7 +89,7 @@ async function openRealRelayStorage(dataDir, fresh) {
     assert.equal(relayTables.ok, true, "relay Evolu tables should be created");
   }
   const storageErrors = [];
-  const storage = createRelaySqliteStorage({
+  const baseStorage = createRelaySqliteStorage({
     random: createRandom(),
     sqlite,
     timingSafeEqual: (a, b) => Buffer.from(a).equals(Buffer.from(b)),
@@ -95,7 +97,20 @@ async function openRealRelayStorage(dataDir, fresh) {
     onStorageError: (error) => storageErrors.push(error),
     isOwnerWithinQuota: () => true,
   });
-  return { sqlite, storage, storageErrors };
+  const replayEvents = [];
+  const replayGuard = createCompactionReplayGuard(dbPath, baseStorage, {
+    emit: (level, event, data) => replayEvents.push({ level, event, data }),
+  });
+  return {
+    sqlite,
+    storage: replayGuard.storage,
+    storageErrors,
+    replayEvents,
+    close() {
+      replayGuard[Symbol.dispose]();
+      sqlite[Symbol.dispose]();
+    },
+  };
 }
 
 test("compactOwner deletes evolu_message rows for the target owner", () => {
@@ -106,6 +121,7 @@ test("compactOwner deletes evolu_message rows for the target owner", () => {
   const result = compactOwner(db, ownerIdBytes);
 
   assert.equal(result.deletedMessages, 5);
+  assert.equal(result.protectedTimestamps, 5);
   const after = db.prepare('SELECT COUNT(*) as c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes);
   assert.equal(after.c, 0);
 });
@@ -152,7 +168,7 @@ test("the real Evolu relay accepts a fresh write after compaction", async () => 
   const initialWrite = await initial.storage.writeMessages(ownerIdBytes, [oldMessage]);
   assert.equal(initialWrite.ok, true, "fixture write should succeed through Evolu storage");
   assert.deepEqual(initial.storageErrors, []);
-  initial.sqlite[Symbol.dispose]();
+  initial.close();
 
   const db = new Database(dbPath);
   compactOwner(db, ownerIdBytes);
@@ -168,10 +184,41 @@ test("the real Evolu relay accepts a fresh write after compaction", async () => 
     timestamp: { millis: 2_000, counter: 0, nodeId: "0011223344556677" },
     change: Buffer.alloc(17),
   };
-  const rebuiltWrite = await rebuilt.storage.writeMessages(ownerIdBytes, [freshMessage]);
-  assert.equal(rebuiltWrite.ok, true, "fresh-owner write must not hit Evolu's non-null assertion");
+  const replayOnly = await rebuilt.storage.writeMessages(ownerIdBytes, [
+    oldMessage,
+  ]);
+  assert.equal(
+    replayOnly.ok,
+    true,
+    "an exact replay is acknowledged without restoring its encrypted payload",
+  );
+  const rebuiltWrite = await rebuilt.storage.writeMessages(ownerIdBytes, [
+    oldMessage,
+    freshMessage,
+  ]);
+  assert.equal(
+    rebuiltWrite.ok,
+    true,
+    "a mixed replay + fresh write must accept the genuinely new message",
+  );
   assert.deepEqual(rebuilt.storageErrors, []);
-  rebuilt.sqlite[Symbol.dispose]();
+  assert.equal(rebuilt.replayEvents.length, 2);
+  assert.equal(rebuilt.replayEvents[0].event, "compaction.replay_filtered");
+  assert.equal(rebuilt.replayEvents[0].data.rejectedMessages, 1);
+  assert.equal(rebuilt.replayEvents[0].data.acceptedMessages, 0);
+  assert.equal(rebuilt.replayEvents[1].data.rejectedMessages, 1);
+  assert.equal(rebuilt.replayEvents[1].data.acceptedMessages, 1);
+  const otherOwnerIdBytes = randomBytes(16);
+  const otherOwnerWrite = await rebuilt.storage.writeMessages(
+    otherOwnerIdBytes,
+    [oldMessage],
+  );
+  assert.equal(
+    otherOwnerWrite.ok,
+    true,
+    "the same timestamp remains valid for an owner that was not compacted",
+  );
+  rebuilt.close();
 
   const verify = new Database(dbPath, { readonly: true });
   const usage = verify
@@ -182,6 +229,10 @@ test("the real Evolu relay accepts a fresh write after compaction", async () => 
   assert.notEqual(usage.lastTimestamp, null);
   assert.equal(
     verify.prepare('SELECT COUNT(*) AS c FROM evolu_message WHERE "ownerId" = ?').get(ownerIdBytes).c,
+    1,
+  );
+  assert.equal(
+    verify.prepare('SELECT COUNT(*) AS c FROM evolu_message WHERE "ownerId" = ?').get(otherOwnerIdBytes).c,
     1,
   );
   verify.close();
@@ -196,6 +247,7 @@ test("compactOwner is idempotent (deletedMessages=0 on already-empty owner)", ()
   const second = compactOwner(db, ownerIdBytes);
 
   assert.equal(second.deletedMessages, 0);
+  assert.equal(second.protectedTimestamps, 5);
   assert.equal(second.beforeStoredBytes, 0);
   assert.equal(second.afterStoredBytes, 0);
 });

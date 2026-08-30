@@ -15,11 +15,13 @@
   "dependencies": {
     "@evolu/common": "^7.4.0",
     "@evolu/nodejs": "^2.4.0",
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^13.0.3",
+    "ws": "^8.21.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^24.13.3",
+    "@types/ws": "^8.18.1",
     "typescript": "^7.0.2"
   },
   "license": "AGPL-3.0-or-later"
