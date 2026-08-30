@@ -22,3 +22,13 @@ updates:
     directory: /
     schedule:
       interval: monthly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /context-gateway
+    schedule:
+      interval: weekly

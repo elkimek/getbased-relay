@@ -2,24 +2,40 @@ services:
   relay:
     build: .
     ports:
-      - "4000:4000"
+      # Caddy is the only public entrypoint. Binding the relay to loopback
+      # prevents bypassing TLS, headers, and host-level request controls.
+      - "127.0.0.1:4000:4000"
       # Self-service endpoints (HMAC-authed). Bind 127.0.0.1 on the host
       # so they only expose through the reverse proxy (Caddy), not
       # directly to the public IP. Set SELF_ENABLED=0 to turn them off.
       - "127.0.0.1:4003:4003"
     volumes:
       - relay-data:/data
+      - context-verifier-socket:/run/getbased-verifier
     environment:
       - RELAY_PORT=4000
       - ADMIN_PORT=4002
       - SELF_PORT=4003
       - SELF_BIND=0.0.0.0
       - SELF_ENABLED=true
+      - CONTEXT_VERIFIER_ENABLED=true
+      - CONTEXT_VERIFIER_SOCKET=/run/getbased-verifier/verifier.sock
+      - CONTEXT_VERIFIER_TOKEN=${CONTEXT_VERIFIER_TOKEN:?set CONTEXT_VERIFIER_TOKEN in .env}
       - QUOTA_PER_OWNER_MB=10
       - QUOTA_GLOBAL_MB=1000
       - LOG_FORMAT=json
       - LOG_LEVEL=info
     restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:4002/health').then(r=>{if(!r.ok)throw 1}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -35,15 +51,32 @@ services:
       - "127.0.0.1:4001:4001"
     volumes:
       - context-data:/opt/context-gateway/data
-      - relay-data:/data:ro
+      - context-verifier-socket:/run/getbased-verifier:ro
     environment:
       - CONTEXT_BIND=0.0.0.0
-      - EVOLU_DB_PATH=/data/evolu-relay.db
+      - CONTEXT_VERIFIER_SOCKET=/run/getbased-verifier/verifier.sock
+      - CONTEXT_VERIFIER_TOKEN=${CONTEXT_VERIFIER_TOKEN:?set CONTEXT_VERIFIER_TOKEN in .env}
+      - CONTEXT_TRUST_PROXY=true
+      - CONTEXT_RATE_LIMIT_PER_MINUTE=300
       - AGENT_CONTEXT_OWNER_QUOTA_BYTES=5242880
       - AGENT_CONTEXT_MAX_PROFILE_BYTES=524288
       - AGENT_CONTEXT_MAX_PROFILES=20
       - AGENT_CONTEXT_MAX_TOKENS=3
     restart: unless-stopped
+    init: true
+    user: node
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    depends_on:
+      relay:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4001/health').then(r=>{if(!r.ok)throw 1}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -53,3 +86,4 @@ services:
 volumes:
   relay-data:
   context-data:
+  context-verifier-socket:

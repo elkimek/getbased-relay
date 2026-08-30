@@ -1,4 +1,4 @@
-FROM node:24-slim AS builder
+FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e AS builder
 
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
@@ -9,7 +9,7 @@ COPY tsconfig.json ./
 COPY src/ src/
 RUN npx tsc
 
-FROM node:24-slim
+FROM node:24-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
 
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
@@ -18,7 +18,8 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && rm -rf /root/.npm
 COPY --from=builder /app/dist dist/
 
-RUN mkdir -p /data && chown node:node /data
+RUN mkdir -p /data /run/getbased-verifier \
+    && chown node:node /data /run/getbased-verifier
 ENV DATA_DIR=/data
 ENV NODE_ENV=production
 

@@ -12,6 +12,7 @@ import { createAdminServer } from "./lib/admin-server.js";
 import { createSelfServer } from "./lib/self-server.js";
 import { runStartupChecks } from "./lib/startup-check.js";
 import { createReplayProtectedRelay } from "./lib/replay-protected-relay.js";
+import { createContextVerifierServer } from "./lib/context-verifier-server.js";
 
 // ─── Config ────────────────────────────────────────────
 const config = loadConfig();
@@ -28,6 +29,9 @@ logger.emit("info", "relay.config", {
   ownerTtlDays: config.ownerTtlDays,
   logLevel: config.logLevel,
   adminAuth: config.adminToken ? "token" : "open",
+  contextVerifier: config.contextVerifierEnabled
+    ? config.contextVerifierSocket ?? `${config.contextVerifierBind}:${config.contextVerifierPort}`
+    : null,
 });
 
 // ─── Data directory ────────────────────────────────────
@@ -81,10 +85,19 @@ await admin.start();
 const self = config.selfEnabled ? createSelfServer(config, logger) : null;
 if (self) await self.start();
 
+// ─── Private Agent Access signature verifier ──────────
+const contextVerifier = config.contextVerifierEnabled
+  ? createContextVerifierServer(config, logger)
+  : null;
+if (contextVerifier) await contextVerifier.start();
+
 logger.emit("info", "relay.ready", {
   relay: `ws://0.0.0.0:${config.relayPort}`,
   admin: `http://127.0.0.1:${config.adminPort}`,
   self: self ? `http://${config.selfBind}:${config.selfPort}` : null,
+  contextVerifier: contextVerifier
+    ? config.contextVerifierSocket ?? `http://${config.contextVerifierBind}:${config.contextVerifierPort}`
+    : null,
 });
 
 // ─── Graceful shutdown ────────────────────────────────
@@ -104,6 +117,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   await admin.stop();
   if (self) await self.stop();
+  if (contextVerifier) await contextVerifier.stop();
 
   logger.emit("info", "relay.stopped");
   process.exit(0);
