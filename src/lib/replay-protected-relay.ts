@@ -1,25 +1,24 @@
 // Evolu's Node relay does not currently expose a storage-decorator hook. This
 // module mirrors its small Node/WebSocket adapter so we can put the compaction
 // replay guard directly around the upstream SQLite storage. Protocol parsing,
-// reconciliation, encryption, and persistence remain Evolu implementations.
+// reconciliation, encryption, persistence, and task lifetimes remain Evolu
+// implementations.
 
 import {
-  createRandom,
+  assert,
   createRelation,
   createSqlite,
-  isAsync,
+  daemon,
+  Name,
   ok,
-  SimpleName,
-  Uint8Array as EvoluUint8Array,
-  type ConsoleDep,
   type OwnerId,
-  type Result,
-  type SqliteError,
+  type Task,
+  tryAsync,
+  Uint8Array as EvoluUint8Array,
 } from "@evolu/common";
 import {
   applyProtocolMessageAsRelay,
   createBaseSqliteStorageTables,
-  createRelayLogger,
   createRelaySqliteStorage,
   createRelayStorageTables,
   defaultProtocolMessageMaxSize,
@@ -28,78 +27,84 @@ import {
   type Relay,
   type RelayConfig,
 } from "@evolu/common/local-first";
-import { createBetterSqliteDriver } from "@evolu/nodejs";
-import { timingSafeEqual } from "node:crypto";
+import type { RelayDeps } from "@evolu/nodejs";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { resolve } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { createCompactionReplayGuard } from "./compaction-replay.js";
 import type { Logger } from "./logger.js";
 
 export interface ReplayProtectedRelayConfig extends RelayConfig {
   readonly port?: number;
+  /** Retained for deployment compatibility; Logger applies the actual level. */
+  readonly enableLogging?: boolean;
 }
 
-interface ReplayProtectedRelayDeps extends ConsoleDep {
+interface LoggerDep {
   readonly logger: Logger;
 }
 
-export const createReplayProtectedRelay =
-  (deps: ReplayProtectedRelayDeps) =>
-  async ({
-    port = 443,
-    name = SimpleName.orThrow("evolu-relay"),
-    enableLogging = false,
-    isOwnerAllowed,
-    isOwnerWithinQuota,
-  }: ReplayProtectedRelayConfig): Promise<Result<Relay, SqliteError>> => {
-    const log = createRelayLogger(deps);
-    log.started(enableLogging, port);
+type ReplayProtectedRelayDeps = RelayDeps & LoggerDep;
 
-    const dbPath = resolve(`${name}.db`);
-    const dbFileExists = existsSync(dbPath);
-    const sqlite = await createSqlite({
-      createSqliteDriver: createBetterSqliteDriver,
-    })(name);
-    if (!sqlite.ok) return sqlite;
+export const createReplayProtectedRelay = ({
+  port = 443,
+  name = Name.orThrow("evolu-relay"),
+  isOwnerAllowed,
+  isOwnerWithinQuota,
+}: ReplayProtectedRelayConfig): Task<Relay, never, ReplayProtectedRelayDeps> =>
+  async (run) => {
+    await using disposer = new AsyncDisposableStack();
+    const { logger } = run.deps;
+    const relayConsole = run.deps.console;
 
-    const sqliteDeps = { sqlite: sqlite.value };
+    const dbFileExists = existsSync(`${name}.db`);
+    const sqlite = disposer.use(await run.ok(createSqlite(name)));
+    const sqliteDeps = { ...run.deps, sqlite };
+
     if (!dbFileExists) {
-      const baseTables = createBaseSqliteStorageTables(sqliteDeps);
-      if (!baseTables.ok) return baseTables;
-      const relayTables = createRelayStorageTables(sqliteDeps);
-      if (!relayTables.ok) return relayTables;
+      createBaseSqliteStorageTables(sqliteDeps);
+      createRelayStorageTables(sqliteDeps);
     }
 
-    const baseStorage = createRelaySqliteStorage({
-      random: createRandom(),
-      sqlite: sqlite.value,
-      timingSafeEqual,
-    })({
-      onStorageError: log.storageError,
+    const baseStorage = createRelaySqliteStorage(sqliteDeps)({
       isOwnerWithinQuota,
     });
-    const replayGuard = createCompactionReplayGuard(
-      dbPath,
-      baseStorage,
-      deps.logger,
+    const replayGuard = disposer.use(
+      createCompactionReplayGuard(`${name}.db`, baseStorage, logger),
     );
     const storage = replayGuard.storage;
+    const relayRun = disposer.use(run.create({ storage }));
 
-    const server = createServer();
-    const wss = new WebSocketServer({
-      maxPayload: defaultProtocolMessageMaxSize,
-      noServer: true,
+    const server = disposer.use(createServer());
+    server.once("close", () => {
+      relayConsole.log("Evolu Relay HTTP server disposed");
     });
+
+    const wss = disposer.adopt(
+      new WebSocketServer({
+        maxPayload: defaultProtocolMessageMaxSize,
+        noServer: true,
+      }),
+      (webSocketServer) =>
+        new Promise<void>((resolve) => {
+          webSocketServer.close(() => {
+            relayConsole.log("Evolu Relay WebSocket server disposed");
+            resolve();
+          });
+        }),
+    );
     const ownerSocketRelation = createRelation<OwnerId, WebSocket>();
 
     server.on("upgrade", (request, socket, head) => {
-      socket.on("error", log.upgradeSocketError);
+      const onSocketError = (error: Error) => {
+        relayConsole.warn("[relay]", "socket error", { error: error.message });
+      };
+      socket.on("error", onSocketError);
 
       const completeUpgrade = () => {
-        socket.removeListener("error", log.upgradeSocketError);
-        wss.handleUpgrade(request, socket, head, (ws: WebSocket) => {
+        socket.removeListener("error", onSocketError);
+        wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit("connection", ws, request);
         });
       };
@@ -109,105 +114,167 @@ export const createReplayProtectedRelay =
         return;
       }
 
-      const ownerId = parseOwnerIdFromOwnerWebSocketTransportUrl(
-        request.url ?? "",
-      );
-      if (!ownerId) {
-        log.invalidOrMissingOwnerIdInUrl(request.url);
-        socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      const respondAndDestroy = (
+        status:
+          | "400 Bad Request"
+          | "401 Unauthorized"
+          | "503 Service Unavailable",
+      ) => {
+        if (socket.destroyed) return;
+        socket.write(`HTTP/1.1 ${status}\r\n\r\n`);
         socket.destroy();
+      };
+
+      const ownerId = request.url
+        ? parseOwnerIdFromOwnerWebSocketTransportUrl(request.url)
+        : undefined;
+      if (!ownerId) {
+        relayConsole.warn("[relay]", "invalid or missing ownerId in URL", {
+          url: request.url,
+        });
+        respondAndDestroy("400 Bad Request");
         return;
       }
 
+      const authorizationFiber = relayRun.abortable(
+        daemon(async (authorizationRun) =>
+          tryAsync(
+            () => isOwnerAllowed(ownerId, { signal: authorizationRun.signal }),
+            (error) => ({ type: "OwnerAuthorizationError", error }) as const,
+          ),
+        ),
+      );
+      const abortAuthorization = () => {
+        authorizationFiber.abort({ type: "WebSocketUpgradeSocketClosed" });
+      };
+      socket.once("close", abortAuthorization);
+      socket.once("error", abortAuthorization);
+
       void (async () => {
-        const result = isOwnerAllowed(ownerId);
-        const isAllowed = isAsync(result) ? await result : result;
-        if (!isAllowed) {
-          log.unauthorizedOwner(ownerId);
-          socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-          socket.destroy();
+        const result = await authorizationFiber;
+        socket.removeListener("close", abortAuthorization);
+        socket.removeListener("error", abortAuthorization);
+
+        if (!result.ok) {
+          if (result.error.type === "AbortError") {
+            socket.destroy();
+            return;
+          }
+          relayConsole.error("[relay]", "authorization error", {
+            error: String(result.error.error),
+          });
+          respondAndDestroy("503 Service Unavailable");
+          return;
+        }
+        if (!result.value) {
+          relayConsole.warn("[relay]", "unauthorized owner", { ownerId });
+          respondAndDestroy("401 Unauthorized");
           return;
         }
         completeUpgrade();
       })();
     });
 
-    wss.on("connection", (ws: WebSocket) => {
-      log.connectionEstablished(wss.clients.size);
+    wss.on("connection", (ws) => {
+      relayConsole.log("[relay]", "connection", {
+        totalConnectionCount: wss.clients.size,
+      });
 
-      ws.on("error", (error: Error) => {
-        log.connectionWebSocketError(error);
+      ws.on("error", (error) => {
+        relayConsole.warn("[relay]", "socket error", { error: error.message });
       });
 
       const options: ApplyProtocolMessageAsRelayOptions = {
         subscribe: (ownerId) => {
           ownerSocketRelation.add(ownerId, ws);
-          log.relayOptionSubscribe(
+          relayConsole.log("[relay]", "subscribe", {
             ownerId,
-            () => ownerSocketRelation.getB(ownerId)?.size ?? 0,
-          );
+            subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
+          });
         },
         unsubscribe: (ownerId) => {
           ownerSocketRelation.remove(ownerId, ws);
-          log.relayOptionUnsubscribe(
+          relayConsole.log("[relay]", "unsubscribe", {
             ownerId,
-            () => ownerSocketRelation.getB(ownerId)?.size ?? 0,
-          );
+            subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
+          });
         },
         broadcast: (ownerId, message) => {
-          const sockets = ownerSocketRelation.getB(ownerId);
-          if (!sockets) return;
           let broadcastCount = 0;
-          for (const socket of sockets) {
+          for (const socket of ownerSocketRelation.iterateB(ownerId)) {
             if (socket !== ws && socket.readyState === WebSocket.OPEN) {
               socket.send(message, { binary: true });
               broadcastCount++;
             }
           }
-          log.relayOptionBroadcast(ownerId, broadcastCount, sockets.size);
+          relayConsole.debug("[relay]", "broadcast", {
+            ownerId,
+            broadcastCount,
+            subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
+          });
         },
       };
 
-      ws.on("message", (message: unknown) => {
+      ws.on("message", (message) => {
         if (!EvoluUint8Array.is(message)) return;
-        log.messageLength(message.length);
-        applyProtocolMessageAsRelay({ storage })(message, options)
-          .then((response) => {
-            if (!response.ok) {
-              log.applyProtocolMessageAsRelayError(response.error);
-              return;
-            }
-            ws.send(response.value.message, { binary: true });
-            log.responseLength(response.value.message.length);
-          })
-          .catch(log.applyProtocolMessageAsRelayUnknownError);
+        relayConsole.debug("[relay]", "on message", {
+          length: message.length,
+        });
+
+        void (async () => {
+          const response = await relayRun.abortable(
+            applyProtocolMessageAsRelay(message, options),
+          );
+          if (!response.ok) {
+            if (response.error.type === "AbortError") return;
+            relayConsole.error("[relay]", "applyProtocolMessageAsRelay", {
+              error: response.error,
+            });
+            return;
+          }
+          ws.send(response.value.message, { binary: true });
+          relayConsole.debug("[relay]", "responseLength", {
+            length: response.value.message.length,
+          });
+        })().catch((error: unknown) => {
+          relayConsole.error(
+            "[relay]",
+            "applyProtocolMessageAsRelayUnknownError",
+            { error: String(error) },
+          );
+        });
       });
 
       ws.on("close", () => {
-        ownerSocketRelation.deleteB(ws);
-        log.connectionClosed(wss.clients.size);
+        ownerSocketRelation.removeByB(ws);
+        relayConsole.log("[relay]", "close", {
+          totalConnectionCount: wss.clients.size,
+        });
       });
     });
 
+    disposer.defer(() => {
+      relayConsole.log("Shutting down Evolu Relay");
+      for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.close(1000, "Evolu Relay shutting down");
+        }
+      }
+    });
+
     server.listen(port);
+    await once(server, "listening");
+    const address = server.address();
+    assert(
+      address !== null && typeof address !== "string",
+      "Expected TCP address",
+    );
 
-    let isDisposed = false;
-    const relay: Relay = {
-      [Symbol.dispose]: () => {
-        if (isDisposed) return;
-        isDisposed = true;
-        log.shuttingDown();
-        wss.clients.forEach((client: WebSocket) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.close(1000, "Evolu Relay shutting down");
-          }
-        });
-        wss.close(() => log.webSocketServerDisposed());
-        server.close(() => log.httpServerDisposed());
-        replayGuard[Symbol.dispose]();
-        sqlite.value[Symbol.dispose]();
-      },
-    };
+    const disposables = disposer.move();
+    relayConsole.log(`Evolu Relay started on port ${address.port}`);
 
-    return ok(relay);
+    return ok({
+      port: address.port,
+      [Symbol.asyncDispose]: () => disposables.disposeAsync(),
+    });
   };

@@ -7,6 +7,7 @@
 //
 // We parse these into structured JSON events at appropriate log levels.
 
+import { createConsole, type Console } from "@evolu/common";
 import type { RelayConfig } from "./config.js";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -36,7 +37,7 @@ const TAG_LEVELS: Record<string, LogLevel> = {
 };
 
 export interface Logger {
-  console: Record<string, unknown>;
+  console: Console;
   emit: (level: LogLevel, event: string, data?: Record<string, unknown>) => void;
   getCurrentConnections: () => number;
   setOwnerCallback: (fn: (ownerId: string) => void) => void;
@@ -111,29 +112,14 @@ export function createLogger(config: RelayConfig): Logger {
     }
   }
 
-  // The Console interface that Evolu expects.
-  // We lock enabled=true so ALL events reach our filter — we handle levels ourselves.
-  const consoleImpl: Record<string, unknown> = {
-    log: (...args: unknown[]) => parseRelayLog("log", args),
-    info: (...args: unknown[]) => parseRelayLog("info", args),
-    warn: (...args: unknown[]) => parseRelayLog("warn", args),
-    error: (...args: unknown[]) => parseRelayLog("error", args),
-    debug: (...args: unknown[]) => parseRelayLog("debug", args),
-    time: () => {},
-    timeLog: () => {},
-    timeEnd: () => {},
-    dir: () => {},
-    table: () => {},
-    count: () => {},
-    countReset: () => {},
-    assert: () => {},
-    trace: () => {},
-  };
-
-  // Lock enabled=true — Evolu tries to set it to false, but we need all events
-  Object.defineProperty(consoleImpl, "enabled", {
-    get: () => true,
-    set: () => {},
+  // Keep Evolu's structured console at trace level so owner subscription events
+  // always reach the tracker. The relay logger above applies the configured
+  // output level after translating those entries into stable JSON events.
+  const consoleImpl = createConsole({
+    level: "trace",
+    output: {
+      write: (entry) => parseRelayLog(entry.method, [...entry.args]),
+    },
   });
 
   return {
