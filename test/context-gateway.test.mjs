@@ -1,12 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Database from 'better-sqlite3';
 
-let server, port, ownerId, writeKey, token, tokenHash, dataDir, dbPath;
+let server, verifierServer, requestIp, port, ownerId, writeKey, token, tokenHash, dataDir;
 
 function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
@@ -21,35 +21,43 @@ function signContext({ profileId = 'default', context, timestamp, tokenHash: has
 
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'context-gateway-data-'));
-  const relayDir = mkdtempSync(join(tmpdir(), 'context-gateway-relay-'));
   mkdirSync(dataDir, { recursive: true });
-  mkdirSync(relayDir, { recursive: true });
-  dbPath = join(relayDir, 'evolu-relay.db');
-  const db = new Database(dbPath);
-  db.exec(`
-    CREATE TABLE evolu_writeKey (
-      "ownerId" blob not null,
-      "writeKey" blob not null,
-      primary key ("ownerId")
-    ) strict;
-  `);
   const ownerBytes = randomBytes(16);
   ownerId = ownerBytes.toString('base64url');
   writeKey = randomBytes(32);
-  db.prepare('INSERT INTO evolu_writeKey ("ownerId", "writeKey") VALUES (?, ?)').run(ownerBytes, writeKey);
-  db.close();
 
   token = 'a'.repeat(64);
   tokenHash = sha256Hex(token);
   port = 15000 + Math.floor(Math.random() * 1000);
+  const verifierSocket = join(dataDir, 'verifier.sock');
+  verifierServer = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const message = `agent-context:${body.ownerId}:${body.timestamp}:${body.tokenHash}:${body.profileId}:${body.contextHash}`;
+      const expected = createHmac('sha256', writeKey).update(message).digest('hex');
+      const ok = req.headers.authorization === 'Bearer verifier-test-token'
+        && body.ownerId === ownerId
+        && body.signature === expected;
+      res.writeHead(ok ? 200 : 401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok }));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    verifierServer.listen(verifierSocket, resolve);
+    verifierServer.on('error', reject);
+  });
   process.env.CONTEXT_DATA_DIR = dataDir;
-  process.env.EVOLU_DB_PATH = dbPath;
+  process.env.CONTEXT_VERIFIER_SOCKET = verifierSocket;
+  process.env.CONTEXT_VERIFIER_TOKEN = 'verifier-test-token';
+  process.env.CONTEXT_CLIENT_IP_HEADER = 'x-getbased-client-ip';
   process.env.CONTEXT_PORT = String(port);
   process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES = '2000';
   process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
-  ({ server } = await import('../context-gateway/server.js?test=' + Date.now()));
+  ({ server, requestIp } = await import('../context-gateway/server.js?test=' + Date.now()));
   await new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', resolve);
     server.on('error', reject);
@@ -58,6 +66,7 @@ before(async () => {
 
 after(async () => {
   if (server?.listening) await new Promise(resolve => server.close(resolve));
+  if (verifierServer?.listening) await new Promise(resolve => verifierServer.close(resolve));
 });
 
 test('owner-bound context POST stores under owner, not raw token namespace', async () => {
@@ -161,6 +170,19 @@ test('health endpoint works without token for docker healthchecks', async () => 
   assert.deepEqual(await res.json(), { status: 'ok' });
 });
 
+test('rate-limit identity ignores X-Forwarded-For and validates the dedicated header', () => {
+  const req = {
+    socket: { remoteAddress: '::ffff:172.18.0.1' },
+    headers: {
+      'x-forwarded-for': '198.51.100.99',
+      'x-getbased-client-ip': '203.0.113.7',
+    },
+  };
+  assert.equal(requestIp(req), '203.0.113.7');
+  req.headers['x-getbased-client-ip'] = '203.0.113.7, 198.51.100.1';
+  assert.equal(requestIp(req), '172.18.0.1');
+});
+
 test('malformed legacy context file returns 404 instead of crashing server', async () => {
   const legacyToken = 'legacy-malformed-token';
   const legacyPath = join(dataDir, Buffer.from(legacyToken).toString('base64url').slice(0, 32) + '.json');
@@ -176,20 +198,8 @@ test('malformed legacy context file returns 404 instead of crashing server', asy
   assert.equal(health.status, 200);
 });
 
-test('write-key lookup follows a recreated Evolu DB file', async () => {
-  const ownerBytes = Buffer.from(ownerId, 'base64url');
+test('write-key rotation is picked up by the verifier without restarting the gateway', async () => {
   const rotatedWriteKey = randomBytes(32);
-  rmSync(dbPath, { force: true });
-  const db = new Database(dbPath);
-  db.exec(`
-    CREATE TABLE evolu_writeKey (
-      "ownerId" blob not null,
-      "writeKey" blob not null,
-      primary key ("ownerId")
-    ) strict;
-  `);
-  db.prepare('INSERT INTO evolu_writeKey ("ownerId", "writeKey") VALUES (?, ?)').run(ownerBytes, rotatedWriteKey);
-  db.close();
   writeKey = rotatedWriteKey;
 
   const profileId = 'p1';

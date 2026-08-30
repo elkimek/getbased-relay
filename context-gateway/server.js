@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import {
   existsSync,
   mkdirSync,
@@ -7,13 +7,15 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import Database from 'better-sqlite3';
 
 const DATA_DIR = process.env.CONTEXT_DATA_DIR || '/opt/context-gateway/data';
-const EVOLU_DB_PATH = process.env.EVOLU_DB_PATH || '/data/evolu-relay.db';
+const VERIFY_URL = process.env.CONTEXT_VERIFY_URL || 'http://127.0.0.1:4004/verify-agent-context';
+const VERIFY_SOCKET = process.env.CONTEXT_VERIFIER_SOCKET || '';
+const VERIFY_TOKEN = process.env.CONTEXT_VERIFIER_TOKEN || '';
 const PORT = Number(process.env.CONTEXT_PORT || 4001);
 const BIND = process.env.CONTEXT_BIND || '127.0.0.1';
 const MAX_CONTEXT_BYTES = Number(process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES || 512 * 1024);
@@ -21,6 +23,11 @@ const OWNER_QUOTA_BYTES = Number(process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES || 
 const MAX_PROFILES_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_PROFILES || 20);
 const MAX_TOKENS_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_TOKENS || 3);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
+const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
+const CLIENT_IP_HEADER = /^[a-z0-9-]+$/i.test(process.env.CONTEXT_CLIENT_IP_HEADER || '')
+  ? process.env.CONTEXT_CLIENT_IP_HEADER.toLowerCase()
+  : '';
+const rateBuckets = new Map();
 
 mkdirSync(DATA_DIR, { recursive: true });
 
@@ -93,42 +100,116 @@ function decodeOwnerId(ownerId) {
   }
 }
 
-function safeEqualHex(aHex, bBuffer) {
-  if (typeof aHex !== 'string' || !/^[0-9a-f]{64}$/i.test(aHex)) return false;
-  const a = Buffer.from(aHex, 'hex');
-  if (a.length !== bBuffer.length) return false;
-  return timingSafeEqual(a, bBuffer);
-}
-
-function lookupWriteKey(ownerBytes) {
-  if (!existsSync(EVOLU_DB_PATH)) return null;
-  let db;
-  try {
-    db = new Database(EVOLU_DB_PATH, { fileMustExist: true, readonly: true });
-    db.pragma('busy_timeout = 5000');
-    const row = db
-      .prepare('SELECT "writeKey" FROM evolu_writeKey WHERE "ownerId" = ?')
-      .get(ownerBytes);
-    return row?.writeKey ?? null;
-  } finally {
-    try { db?.close(); } catch {}
-  }
-}
-
-function verifyOwnerSignature({ ownerId, timestamp, signature, tokenHash, profileId, context }) {
+async function verifyOwnerSignature({ ownerId, timestamp, signature, tokenHash, profileId, context }) {
   const ownerBytes = decodeOwnerId(ownerId);
   if (!ownerBytes) return { ok: false, status: 400, error: 'invalid_owner_id' };
   if (!Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > TIMESTAMP_WINDOW_MS) {
     return { ok: false, status: 401, error: 'timestamp_outside_window' };
   }
-  const writeKey = lookupWriteKey(ownerBytes);
   const contextHash = sha256Hex(context);
-  const message = `agent-context:${ownerId}:${timestamp}:${tokenHash}:${profileId || 'default'}:${contextHash}`;
-  const expected = createHmac('sha256', writeKey ?? Buffer.alloc(32)).update(message).digest();
-  if (!writeKey || !safeEqualHex(signature, expected)) {
-    return { ok: false, status: 401, error: 'unauthorized' };
+  if (!VERIFY_TOKEN) {
+    return { ok: false, status: 503, error: 'verification_unavailable' };
   }
-  return { ok: true, ownerId, contextHash };
+  const payload = {
+    ownerId,
+    timestamp,
+    signature,
+    tokenHash,
+    profileId: profileId || 'default',
+    contextHash,
+  };
+  try {
+    const status = VERIFY_SOCKET
+      ? await verifyOverSocket(payload)
+      : await verifyOverHttp(payload);
+    if (status >= 200 && status < 300) return { ok: true, ownerId, contextHash };
+    if (status === 401 || status === 400) {
+      return { ok: false, status: 401, error: 'unauthorized' };
+    }
+  } catch {}
+  return { ok: false, status: 503, error: 'verification_unavailable' };
+}
+
+async function verifyOverHttp(payload) {
+  const response = await fetch(VERIFY_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${VERIFY_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5000),
+  });
+  return response.status;
+}
+
+function verifyOverSocket(payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const request = httpRequest({
+      socketPath: VERIFY_SOCKET,
+      path: '/verify-agent-context',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${VERIFY_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, response => {
+      response.resume();
+      response.on('end', () => resolve(response.statusCode || 503));
+    });
+    request.setTimeout(5000, () => request.destroy(new Error('verification_timeout')));
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+function requestIp(req) {
+  const peer = String(req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+  const supplied = CLIENT_IP_HEADER ? req.headers[CLIENT_IP_HEADER] : '';
+  const candidate = Array.isArray(supplied) ? supplied[0] : String(supplied || '');
+  return isIP(candidate.trim()) ? candidate.trim() : (isIP(peer) ? peer : 'unknown');
+}
+
+function rateCheck(req) {
+  if (!Number.isFinite(RATE_LIMIT_PER_MINUTE) || RATE_LIMIT_PER_MINUTE <= 0) return true;
+  const now = Date.now();
+  const key = requestIp(req);
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= 60_000) {
+    bucket = { startedAt: now, count: 0 };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (rateBuckets.size > 10_000) {
+    for (const [candidate, value] of rateBuckets) {
+      if (now - value.startedAt >= 60_000) rateBuckets.delete(candidate);
+    }
+    while (rateBuckets.size > 10_000) {
+      rateBuckets.delete(rateBuckets.keys().next().value);
+    }
+  }
+  return bucket.count <= RATE_LIMIT_PER_MINUTE;
+}
+
+function rejectRateLimited(res) {
+  res.setHeader('Retry-After', '60');
+  json(res, 429, { error: 'rate_limited' });
+}
+
+function addSecurityHeaders(res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+}
+
+function requireRateAllowance(req, res) {
+  if (!rateCheck(req)) {
+    rejectRateLimited(res);
+    return false;
+  }
+  return true;
 }
 
 function authToken(req) {
@@ -180,7 +261,7 @@ async function handlePostContext(req, res, token, tokenHash) {
     return;
   }
 
-  const proof = verifyOwnerSignature({
+  const proof = await verifyOwnerSignature({
     ownerId: data.ownerId,
     timestamp: Number(data.timestamp),
     signature: data.signature,
@@ -286,7 +367,7 @@ async function handleDeleteContext(req, res, tokenHash) {
     json(res, 200, { ok: true, deleted: false });
     return;
   }
-  const proof = verifyOwnerSignature({
+  const proof = await verifyOwnerSignature({
     ownerId: data.ownerId,
     timestamp: Number(data.timestamp),
     signature: data.signature,
@@ -312,6 +393,7 @@ async function handleDeleteContext(req, res, tokenHash) {
 }
 
 const server = createServer((req, res) => {
+  addSecurityHeaders(res);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -327,6 +409,8 @@ const server = createServer((req, res) => {
     json(res, 200, { status: 'ok' });
     return;
   }
+
+  if (!requireRateAllowance(req, res)) return;
 
   const token = authToken(req);
   if (!token) {
@@ -353,6 +437,11 @@ const server = createServer((req, res) => {
   json(res, 404, { error: 'Not found' });
 });
 
+server.headersTimeout = 5000;
+server.requestTimeout = 10000;
+server.keepAliveTimeout = 5000;
+server.maxRequestsPerSocket = 100;
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   server.listen(PORT, BIND, () => {
     console.log(`Context gateway running on ${BIND}:${PORT}`);
@@ -364,4 +453,5 @@ export {
   server,
   sha256Hex,
   verifyOwnerSignature,
+  requestIp,
 };

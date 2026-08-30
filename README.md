@@ -61,6 +61,11 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `SELF_PORT` | `4003` | Owner-scoped self-service HTTP port |
 | `SELF_BIND` | `127.0.0.1` | Bind address for self-service port (set to `0.0.0.0` to expose directly without a reverse proxy) |
 | `SELF_ENABLED` | `true` | Set `false` to disable `/self/*` endpoints |
+| `CONTEXT_VERIFIER_PORT` | `4004` | Private Agent Access proof-verification port |
+| `CONTEXT_VERIFIER_BIND` | `127.0.0.1` | Verifier TCP bind address when a Unix socket is not configured |
+| `CONTEXT_VERIFIER_SOCKET` | *(none)* | Unix socket path; takes precedence over TCP and is used by the supplied compose deployment |
+| `CONTEXT_VERIFIER_ENABLED` | `false` | Enables the private verifier; compose enables it for Context Gateway |
+| `CONTEXT_VERIFIER_TOKEN` | *(none)* | Required separate bearer when the private verifier is enabled |
 | `QUOTA_PER_OWNER_MB` | `10` | Max stored bytes per identity |
 | `QUOTA_GLOBAL_MB` | `1000` | Max total stored bytes |
 | `OWNER_TTL_DAYS` | `90` | Days before owner flagged as stale |
@@ -160,11 +165,29 @@ Agent Access storage is owner-bound, not token-bound:
 - the browser encrypts context locally before upload;
 - the bearer token is only a read capability;
 - every write is HMAC-signed with the Evolu owner's `writeKey`;
-- the gateway looks up that write key in the relay SQLite DB and stores context under `/owners/<ownerId>.json`;
+- the gateway sends the proof to a private relay verifier that returns only yes/no; the gateway never mounts the relay database and never receives a write key;
 - token hashes map to owner IDs in `agent-token-map.json`;
 - per-owner limits cap profiles, active tokens, per-profile payload size, and total Agent Access storage.
 
 This prevents users from bypassing relay quota by generating unlimited random Agent Access tokens. Legacy token-hash files remain readable during rollout, but new writes require owner proof.
+
+The verifier listens on a shared Unix socket and requires a
+separate `CONTEXT_VERIFIER_TOKEN`. Generate that deployment token with
+`openssl rand -hex 32`; it is an internal caller credential, not an Evolu
+owner key. The public Agent Access protocol and browser HMAC format are
+unchanged.
+
+The supplied Context Gateway limiter keys on a dedicated
+`X-Getbased-Client-IP` header rather than `X-Forwarded-For`. The reverse proxy
+must overwrite it from the actual socket peer:
+
+```caddyfile
+handle /api/* {
+    reverse_proxy 127.0.0.1:4001 {
+        header_up X-Getbased-Client-IP {http.request.remote.host}
+    }
+}
+```
 
 ### Endpoints
 
@@ -185,6 +208,7 @@ The `docker-compose.yml` runs both services:
 |---|---|---|
 | Evolu relay | `:4000` | CRDT sync (WebSocket) |
 | Context gateway | `:4001` | Lab context API (HTTP) |
+| Private verifier | Unix socket | Internal yes/no owner-proof verification; no listening TCP port |
 
 ```bash
 docker compose up -d

@@ -6,6 +6,11 @@ export interface RelayConfig {
   selfPort: number;
   selfBind: string;
   selfEnabled: boolean;
+  contextVerifierPort: number;
+  contextVerifierBind: string;
+  contextVerifierSocket: string | null;
+  contextVerifierEnabled: boolean;
+  contextVerifierToken: string | null;
   relayName: string;
   dataDir: string;
   quotaPerOwnerBytes: number;
@@ -54,6 +59,16 @@ export function loadConfig(): RelayConfig {
     selfPort: envInt("SELF_PORT", 4003),
     selfBind: envStr("SELF_BIND", "127.0.0.1"),
     selfEnabled: envBool("SELF_ENABLED", true),
+    // Private verification oracle for the optional context gateway. It
+    // deliberately returns only yes/no so the gateway never needs the relay
+    // database (and therefore can never read every owner's write key).
+    // Disabled by default; the compose deployment enables it on a shared
+    // Unix socket protected by a separate bearer token.
+    contextVerifierPort: envInt("CONTEXT_VERIFIER_PORT", 4004),
+    contextVerifierBind: envStr("CONTEXT_VERIFIER_BIND", "127.0.0.1"),
+    contextVerifierSocket: process.env.CONTEXT_VERIFIER_SOCKET || null,
+    contextVerifierEnabled: envBool("CONTEXT_VERIFIER_ENABLED", false),
+    contextVerifierToken: process.env.CONTEXT_VERIFIER_TOKEN || null,
     relayName: envStr("RELAY_NAME", "evolu-relay"),
     dataDir: resolve(envStr("DATA_DIR", "./data")),
     quotaPerOwnerBytes: envInt("QUOTA_PER_OWNER_MB", 10) * 1024 * 1024,
@@ -71,6 +86,25 @@ export function loadConfig(): RelayConfig {
   if (config.selfEnabled) {
     if (config.selfPort === config.relayPort || config.selfPort === config.adminPort) {
       throw new Error("SELF_PORT must differ from RELAY_PORT and ADMIN_PORT");
+    }
+  }
+  if (config.contextVerifierEnabled) {
+    if (!config.contextVerifierToken) {
+      throw new Error(
+        "CONTEXT_VERIFIER_TOKEN is required when CONTEXT_VERIFIER_ENABLED=true",
+      );
+    }
+    if (
+      !config.contextVerifierSocket &&
+      (
+        config.contextVerifierPort === config.relayPort ||
+        config.contextVerifierPort === config.adminPort ||
+        (config.selfEnabled && config.contextVerifierPort === config.selfPort)
+      )
+    ) {
+      throw new Error(
+        "CONTEXT_VERIFIER_PORT must differ from RELAY_PORT, ADMIN_PORT, and SELF_PORT",
+      );
     }
   }
 

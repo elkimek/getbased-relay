@@ -2,8 +2,5 @@
   "name": "getbased-context-gateway",
   "version": "1.3.0",
   "type": "module",
-  "private": true,
-  "dependencies": {
-    "better-sqlite3": "^12.9.0"
-  }
+  "private": true
 }
