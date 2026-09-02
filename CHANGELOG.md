@@ -2,6 +2,17 @@
 
 Notable changes to getbased-relay are documented here. The project follows Semantic Versioning.
 
+## [2.1.0] - 2026-09-02
+
+### Added
+
+- Added authenticated, owner-isolated Agent Access proposal queue routes that store only strict opaque ciphertext envelopes for browser review.
+
+### Security
+
+- Added owner/token-bound acknowledgement receipts so consumed proposals cannot be replayed into the live queue.
+- Enforced context-state-aware serialized pending-envelope-plus-receipt storage and retained-ID caps, preventing queue/acknowledge cycling, unsafe count/quota combinations, or large pending ciphertext from consuming existing context bytes plus one valid maximum-size context add or replacement.
+
 ## [2.0.0] - 2026-09-02
 
 ### Breaking changes

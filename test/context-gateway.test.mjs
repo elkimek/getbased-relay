@@ -2,7 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,11 +12,52 @@ function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+function bearer(value) {
+  return ['Bear', 'er ', value].join('');
+}
+
 function signContext({ profileId = 'default', context, timestamp, tokenHash: hash = tokenHash }) {
   const contextHash = sha256Hex(context);
   return createHmac('sha256', writeKey)
     .update(`agent-context:${ownerId}:${timestamp}:${hash}:${profileId}:${contextHash}`)
     .digest('hex');
+}
+
+function proposalIdFromIv(iv) {
+  return `proposal_${createHash('sha256').update(iv).digest('base64url').slice(0, 24)}`;
+}
+
+function validProposalEnvelope(ivByte = 7) {
+  const iv = Buffer.alloc(12, ivByte);
+  return {
+    version: 1,
+    alg: 'AES-256-GCM',
+    keyDerivation: 'raw-256-bit-key',
+    keyId: 'AAECAwQFBgcICQoL',
+    proposalId: proposalIdFromIv(iv),
+    iv: iv.toString('base64'),
+    ciphertext: Buffer.alloc(64, 9).toString('base64'),
+  };
+}
+
+function ownerProposalStorageBudget() {
+  const owner = JSON.parse(readFileSync(join(dataDir, 'owners', `${ownerId}.json`), 'utf8'));
+  const sizes = Object.values(owner.contexts || {}).map(value => Buffer.byteLength(String(value || ''), 'utf8'));
+  const currentContextBytes = sizes.reduce((sum, size) => sum + size, 0);
+  const reservedContextBytes = sizes.length < 3
+    ? currentContextBytes + 1000
+    : currentContextBytes - Math.min(...sizes) + 1000;
+  return Math.max(0, 2000 - reservedContextBytes);
+}
+
+function contextWithExactBytes(size, keyId) {
+  const prefix = `{"encryptedContext":{"version":2,"keyId":"${keyId}","ciphertext":"`;
+  const suffix = '"}}';
+  const padding = size - Buffer.byteLength(prefix + suffix, 'utf8');
+  assert.ok(padding >= 0);
+  const value = `${prefix}${'x'.repeat(padding)}${suffix}`;
+  assert.equal(Buffer.byteLength(value, 'utf8'), size);
+  return value;
 }
 
 before(async () => {
@@ -57,6 +98,7 @@ before(async () => {
   process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
+  process.env.AGENT_PROPOSAL_MAX_TRACKED = '999';
   ({ server, requestIp } = await import('../context-gateway/server.js?test=' + Date.now()));
   await new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', resolve);
@@ -71,7 +113,13 @@ after(async () => {
 
 test('owner-bound context POST stores under owner, not raw token namespace', async () => {
   const profileId = 'p1';
-  const context = JSON.stringify({ encryptedContext: { version: 2, ciphertext: 'abc' } });
+  const context = JSON.stringify({
+    encryptedContext: {
+      version: 2,
+      keyId: validProposalEnvelope().keyId,
+      ciphertext: 'abc',
+    },
+  });
   const timestamp = Date.now();
   const signature = signContext({ profileId, context, timestamp });
   const post = await fetch(`http://127.0.0.1:${port}/api/context`, {
@@ -91,6 +139,236 @@ test('owner-bound context POST stores under owner, not raw token namespace', asy
   const body = await get.json();
   assert.equal(body.profileId, 'p1');
   assert.equal(body.context, context);
+});
+
+test('token-bound proposal queue stores only a strict ciphertext envelope', async () => {
+  const envelope = validProposalEnvelope();
+  const post = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(post.status, 201);
+  assert.deepEqual(await post.json(), {
+    ok: true,
+    proposalId: envelope.proposalId,
+    duplicate: false,
+  });
+
+  const get = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(get.status, 200);
+  const body = await get.json();
+  assert.equal(body.proposals.length, 1);
+  assert.equal(body.proposals[0].proposalId, envelope.proposalId);
+  assert.deepEqual(body.proposals[0].envelope, envelope);
+  assert.equal(typeof body.proposals[0].createdAt, 'string');
+  assert.doesNotMatch(JSON.stringify(body), /Sunbathing|durationMinutes|profileId/);
+});
+
+test('proposal submission is idempotent and conflicting ciphertext is rejected', async () => {
+  const envelope = validProposalEnvelope();
+  const duplicate = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(duplicate.status, 200);
+  assert.equal((await duplicate.json()).duplicate, true);
+
+  const conflictEnvelope = { ...envelope, ciphertext: Buffer.alloc(64, 4).toString('base64') };
+  const conflict = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope: conflictEnvelope }),
+  });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).error, 'proposal_id_conflict');
+});
+
+test('proposal queue rejects caller-controlled plaintext metadata', async () => {
+  const envelope = validProposalEnvelope(8);
+  const semanticId = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      envelope: { ...envelope, proposalId: 'proposal_Sunbathing_60min' },
+    }),
+  });
+  assert.equal(semanticId.status, 400);
+  assert.equal((await semanticId.json()).error, 'invalid_proposal_envelope');
+
+  const semanticKey = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      envelope: { ...envelope, keyId: 'Sunbathing60min_' },
+    }),
+  });
+  assert.equal(semanticKey.status, 400);
+  assert.equal((await semanticKey.json()).error, 'invalid_proposal_envelope');
+});
+
+test('proposal queue rejects plaintext-shaped and unmapped submissions', async () => {
+  const plaintext = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      envelope: {
+        ...validProposalEnvelope(9),
+        payload: { durationMinutes: 60 },
+      },
+    }),
+  });
+  assert.equal(plaintext.status, 400);
+  assert.equal((await plaintext.json()).error, 'invalid_proposal_envelope');
+
+  const unmapped = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${'f'.repeat(64)}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope: validProposalEnvelope(10) }),
+  });
+  assert.equal(unmapped.status, 404);
+  assert.equal((await unmapped.json()).error, 'agent_access_not_registered');
+});
+
+test('a token can acknowledge only its own queued proposal', async () => {
+  const proposalId = validProposalEnvelope().proposalId;
+  const remove = await fetch(`http://127.0.0.1:${port}/api/agent-proposals/${proposalId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(remove.status, 200);
+  assert.deepEqual(await remove.json(), { ok: true, deleted: true });
+
+  const get = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(get.status, 200);
+  assert.deepEqual((await get.json()).proposals, []);
+});
+
+test('an acknowledged proposal id cannot be queued again', async () => {
+  const envelope = validProposalEnvelope(11);
+  const profileId = 'p1';
+  const context = JSON.stringify({
+    encryptedContext: { version: 2, keyId: envelope.keyId, ciphertext: 'abc' },
+  });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const registered = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(registered.status, 200);
+
+  const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(created.status, 201);
+
+  const acknowledged = await fetch(
+    `http://127.0.0.1:${port}/api/agent-proposals/${envelope.proposalId}`,
+    { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } },
+  );
+  assert.equal(acknowledged.status, 200);
+
+  const replayed = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(replayed.status, 200);
+  assert.equal((await replayed.json()).duplicate, true);
+
+  const remaining = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.deepEqual((await remaining.json()).proposals, []);
+});
+
+test('owner proposal byte reserve rejects a large pending envelope before context capacity is consumed', async () => {
+  const envelope = {
+    ...validProposalEnvelope(18),
+    ciphertext: Buffer.alloc(300, 7).toString('base64url'),
+  };
+  const rejected = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(rejected.status, 409);
+  assert.deepEqual(await rejected.json(), {
+    error: 'proposal_owner_storage_limit_exceeded',
+    maxProposalStorageBytes: ownerProposalStorageBudget(),
+  });
+
+  const profileId = 'p1';
+  const context = JSON.stringify({
+    encryptedContext: {
+      version: 2,
+      keyId: validProposalEnvelope().keyId,
+      ciphertext: 'still-writable-after-large-pending',
+    },
+  });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const writable = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(writable.status, 200);
+});
+
+test('owner proposal storage limit preserves context capacity when configured count is too high', async () => {
+  for (const ivByte of [12]) {
+    const envelope = validProposalEnvelope(ivByte);
+    const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+      method: 'POST',
+      headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ envelope }),
+    });
+    assert.equal(created.status, 201);
+    const acknowledged = await fetch(
+      `http://127.0.0.1:${port}/api/agent-proposals/${envelope.proposalId}`,
+      { method: 'DELETE', headers: { Authorization: bearer(token) } },
+    );
+    assert.equal(acknowledged.status, 200);
+  }
+
+  const blocked = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope: validProposalEnvelope(13) }),
+  });
+  assert.equal(blocked.status, 409);
+  assert.deepEqual(await blocked.json(), {
+    error: 'proposal_owner_storage_limit_exceeded',
+    maxProposalStorageBytes: ownerProposalStorageBudget(),
+  });
+
+  const profileId = 'p1';
+  const context = contextWithExactBytes(1000, validProposalEnvelope().keyId);
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const contextWrite = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(contextWrite.status, 200);
+});
+
+test('compose documents the proposal limit names consumed by the gateway runtime', () => {
+  const compose = readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
+  assert.match(compose, /AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES=65536/);
+  assert.match(compose, /AGENT_PROPOSAL_MAX_TRACKED=256/);
+  assert.match(compose, /AGENT_PROPOSAL_RETENTION_MS=86400000/);
 });
 
 test('wrong owner signature is rejected and creates no token mapping', async () => {
