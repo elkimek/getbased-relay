@@ -78,6 +78,7 @@ before(async () => {
   process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
+  process.env.AGENT_PROPOSAL_MAX_TRACKED = '4';
   ({ server, requestIp } = await import('../context-gateway/server.js?test=' + Date.now()));
   await new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', resolve);
@@ -270,9 +271,51 @@ test('an acknowledged proposal id cannot be queued again', async () => {
   assert.deepEqual((await remaining.json()).proposals, []);
 });
 
+test('retained proposal ids cannot exhaust owner storage through acknowledge cycles', async () => {
+  for (const ivByte of [12, 13]) {
+    const envelope = validProposalEnvelope(ivByte);
+    const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+      method: 'POST',
+      headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ envelope }),
+    });
+    assert.equal(created.status, 201);
+    const acknowledged = await fetch(
+      `http://127.0.0.1:${port}/api/agent-proposals/${envelope.proposalId}`,
+      { method: 'DELETE', headers: { Authorization: bearer(token) } },
+    );
+    assert.equal(acknowledged.status, 200);
+  }
+
+  const blocked = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope: validProposalEnvelope(14) }),
+  });
+  assert.equal(blocked.status, 409);
+  assert.deepEqual(await blocked.json(), {
+    error: 'proposal_retention_limit_exceeded',
+    maxTracked: 4,
+  });
+
+  const profileId = 'p1';
+  const context = JSON.stringify({
+    encryptedContext: { version: 2, keyId: validProposalEnvelope().keyId, ciphertext: 'still-writable' },
+  });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const contextWrite = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(contextWrite.status, 200);
+});
+
 test('compose documents the proposal limit names consumed by the gateway runtime', () => {
   const compose = readFileSync(new URL('../docker-compose.yml', import.meta.url), 'utf8');
   assert.match(compose, /AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES=65536/);
+  assert.match(compose, /AGENT_PROPOSAL_MAX_TRACKED=256/);
   assert.match(compose, /AGENT_PROPOSAL_RETENTION_MS=86400000/);
 });
 

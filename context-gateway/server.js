@@ -24,6 +24,9 @@ const MAX_PROFILES_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_PROFILES || 
 const MAX_TOKENS_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_TOKENS || 3);
 const MAX_PROPOSAL_CIPHERTEXT_BYTES = Number(process.env.AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES || 64 * 1024);
 const MAX_PENDING_PROPOSALS_PER_TOKEN = Number(process.env.AGENT_PROPOSAL_MAX_PENDING || 20);
+const configuredMaxTrackedProposals = Number(process.env.AGENT_PROPOSAL_MAX_TRACKED || 256);
+const MAX_TRACKED_PROPOSALS_PER_TOKEN = Number.isSafeInteger(configuredMaxTrackedProposals)
+  && configuredMaxTrackedProposals > 0 ? configuredMaxTrackedProposals : 256;
 const PROPOSAL_RETENTION_MS = Number(process.env.AGENT_PROPOSAL_RETENTION_MS || 24 * 60 * 60 * 1000);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
@@ -460,6 +463,14 @@ async function handlePostProposal(req, res, tokenHash) {
   const pendingForToken = owner.proposals.filter(proposal => proposal.tokenHash === tokenHash).length;
   if (pendingForToken >= MAX_PENDING_PROPOSALS_PER_TOKEN) {
     json(res, 409, { error: 'proposal_limit_exceeded', maxPending: MAX_PENDING_PROPOSALS_PER_TOKEN });
+    return;
+  }
+  const receiptsForToken = owner.proposalReceipts.filter(receipt => receipt.tokenHash === tokenHash).length;
+  if (pendingForToken + receiptsForToken >= MAX_TRACKED_PROPOSALS_PER_TOKEN) {
+    json(res, 409, {
+      error: 'proposal_retention_limit_exceeded',
+      maxTracked: MAX_TRACKED_PROPOSALS_PER_TOKEN,
+    });
     return;
   }
 

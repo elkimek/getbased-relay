@@ -230,7 +230,7 @@ All endpoints require an Agent Access bearer token in the `Authorization` header
 
 Proposal submission is not an execution API. The browser decrypts the envelope locally, revalidates profile, capability, expiry, action schema, and replay state, then requires explicit user approval before invoking an app-owned action.
 
-Proposal limits are configured with `AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES` (default 64 KiB ciphertext), `AGENT_PROPOSAL_MAX_PENDING` (default 20 per token), and `AGENT_PROPOSAL_RETENTION_MS` (default 24 hours).
+Proposal limits are configured with `AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES` (default 64 KiB ciphertext), `AGENT_PROPOSAL_MAX_PENDING` (default 20 pending per token), `AGENT_PROPOSAL_MAX_TRACKED` (default 256 pending plus acknowledged IDs per token), and `AGENT_PROPOSAL_RETENTION_MS` (default 24 hours). The tracked-ID bound prevents an authorized token from cycling queue and acknowledgement requests until replay receipts consume the owner's shared storage quota.
 
 ### Docker Compose
 
