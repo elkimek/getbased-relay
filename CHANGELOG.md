@@ -11,7 +11,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 ### Security
 
 - Added owner/token-bound acknowledgement receipts so consumed proposals cannot be replayed into the live queue.
-- Enforced a per-token cap across pending and acknowledged proposal IDs, preventing queue/acknowledge cycling from exhausting shared owner storage while retaining replay tombstones.
+- Enforced per-token and owner-byte-derived caps across pending and acknowledged proposal IDs, preventing queue/acknowledge cycling or unsafe count/quota combinations from exhausting shared owner storage while retaining replay tombstones and one maximum-size context reserve.
 
 ## [2.0.0] - 2026-09-02
 

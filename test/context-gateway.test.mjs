@@ -75,10 +75,10 @@ before(async () => {
   process.env.CONTEXT_CLIENT_IP_HEADER = 'x-getbased-client-ip';
   process.env.CONTEXT_PORT = String(port);
   process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES = '2000';
-  process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
+  process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1200';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
-  process.env.AGENT_PROPOSAL_MAX_TRACKED = '4';
+  process.env.AGENT_PROPOSAL_MAX_TRACKED = '999';
   ({ server, requestIp } = await import('../context-gateway/server.js?test=' + Date.now()));
   await new Promise((resolve, reject) => {
     server.listen(port, '127.0.0.1', resolve);
@@ -271,7 +271,7 @@ test('an acknowledged proposal id cannot be queued again', async () => {
   assert.deepEqual((await remaining.json()).proposals, []);
 });
 
-test('retained proposal ids cannot exhaust owner storage through acknowledge cycles', async () => {
+test('owner byte quota bounds retained proposal ids below an oversized configured count', async () => {
   for (const ivByte of [12, 13]) {
     const envelope = validProposalEnvelope(ivByte);
     const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
@@ -294,8 +294,8 @@ test('retained proposal ids cannot exhaust owner storage through acknowledge cyc
   });
   assert.equal(blocked.status, 409);
   assert.deepEqual(await blocked.json(), {
-    error: 'proposal_retention_limit_exceeded',
-    maxTracked: 4,
+    error: 'proposal_owner_retention_limit_exceeded',
+    maxTrackedOwner: 4,
   });
 
   const profileId = 'p1';

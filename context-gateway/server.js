@@ -27,6 +27,18 @@ const MAX_PENDING_PROPOSALS_PER_TOKEN = Number(process.env.AGENT_PROPOSAL_MAX_PE
 const configuredMaxTrackedProposals = Number(process.env.AGENT_PROPOSAL_MAX_TRACKED || 256);
 const MAX_TRACKED_PROPOSALS_PER_TOKEN = Number.isSafeInteger(configuredMaxTrackedProposals)
   && configuredMaxTrackedProposals > 0 ? configuredMaxTrackedProposals : 256;
+const PROPOSAL_RECEIPT_BYTES = Buffer.byteLength(JSON.stringify({
+  proposalId: `proposal_${'A'.repeat(24)}`,
+  tokenHash: '0'.repeat(64),
+  acknowledgedAt: '2000-01-01T00:00:00.000Z',
+}), 'utf8');
+const OWNER_TRACKED_PROPOSAL_BUDGET_BYTES = Math.max(
+  0,
+  OWNER_QUOTA_BYTES - Math.min(MAX_CONTEXT_BYTES, OWNER_QUOTA_BYTES),
+);
+const MAX_TRACKED_PROPOSALS_PER_OWNER = Math.floor(
+  OWNER_TRACKED_PROPOSAL_BUDGET_BYTES / PROPOSAL_RECEIPT_BYTES,
+);
 const PROPOSAL_RETENTION_MS = Number(process.env.AGENT_PROPOSAL_RETENTION_MS || 24 * 60 * 60 * 1000);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
@@ -470,6 +482,14 @@ async function handlePostProposal(req, res, tokenHash) {
     json(res, 409, {
       error: 'proposal_retention_limit_exceeded',
       maxTracked: MAX_TRACKED_PROPOSALS_PER_TOKEN,
+    });
+    return;
+  }
+  const trackedForOwner = owner.proposals.length + owner.proposalReceipts.length;
+  if (trackedForOwner >= MAX_TRACKED_PROPOSALS_PER_OWNER) {
+    json(res, 409, {
+      error: 'proposal_owner_retention_limit_exceeded',
+      maxTrackedOwner: MAX_TRACKED_PROPOSALS_PER_OWNER,
     });
     return;
   }

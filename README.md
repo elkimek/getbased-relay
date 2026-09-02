@@ -192,7 +192,8 @@ Agent Access context storage is owner-bound. Proposal queues are owner-mapped an
 - per-owner limits cap profiles, active tokens, per-profile payload size, and total Agent Access storage.
 - proposal records contain only a strict AES-GCM envelope plus opaque proposal ID and server timestamp; the gateway never receives action plaintext;
 - each proposal ID is deterministically derived from its random AES-GCM IV, and the envelope key ID must match a context key already registered by the owner-signed browser context;
-- proposal IDs are idempotent per token, queues are bounded, and old records expire automatically.
+- proposal IDs are idempotent per token, queues are bounded, and old records expire automatically;
+- retained proposal IDs are bounded both per token and owner-wide: the owner-wide ceiling is derived from serialized receipt bytes and always reserves one maximum-size encrypted context inside the owner storage quota.
 
 This prevents users from bypassing relay quota by generating unlimited random Agent Access tokens. Legacy token-hash files remain readable during rollout, but new writes require owner proof.
 
