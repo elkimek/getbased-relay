@@ -40,6 +40,26 @@ function validProposalEnvelope(ivByte = 7) {
   };
 }
 
+function ownerProposalStorageBudget() {
+  const owner = JSON.parse(readFileSync(join(dataDir, 'owners', `${ownerId}.json`), 'utf8'));
+  const sizes = Object.values(owner.contexts || {}).map(value => Buffer.byteLength(String(value || ''), 'utf8'));
+  const currentContextBytes = sizes.reduce((sum, size) => sum + size, 0);
+  const reservedContextBytes = sizes.length < 3
+    ? currentContextBytes + 1000
+    : currentContextBytes - Math.min(...sizes) + 1000;
+  return Math.max(0, 2000 - reservedContextBytes);
+}
+
+function contextWithExactBytes(size, keyId) {
+  const prefix = `{"encryptedContext":{"version":2,"keyId":"${keyId}","ciphertext":"`;
+  const suffix = '"}}';
+  const padding = size - Buffer.byteLength(prefix + suffix, 'utf8');
+  assert.ok(padding >= 0);
+  const value = `${prefix}${'x'.repeat(padding)}${suffix}`;
+  assert.equal(Buffer.byteLength(value, 'utf8'), size);
+  return value;
+}
+
 before(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'context-gateway-data-'));
   mkdirSync(dataDir, { recursive: true });
@@ -284,7 +304,7 @@ test('owner proposal byte reserve rejects a large pending envelope before contex
   assert.equal(rejected.status, 409);
   assert.deepEqual(await rejected.json(), {
     error: 'proposal_owner_storage_limit_exceeded',
-    maxProposalStorageBytes: 1000,
+    maxProposalStorageBytes: ownerProposalStorageBudget(),
   });
 
   const profileId = 'p1';
@@ -306,7 +326,7 @@ test('owner proposal byte reserve rejects a large pending envelope before contex
 });
 
 test('owner proposal storage limit preserves context capacity when configured count is too high', async () => {
-  for (const ivByte of [12, 13]) {
+  for (const ivByte of [12]) {
     const envelope = validProposalEnvelope(ivByte);
     const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
       method: 'POST',
@@ -324,18 +344,16 @@ test('owner proposal storage limit preserves context capacity when configured co
   const blocked = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
     method: 'POST',
     headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ envelope: validProposalEnvelope(14) }),
+    body: JSON.stringify({ envelope: validProposalEnvelope(13) }),
   });
   assert.equal(blocked.status, 409);
   assert.deepEqual(await blocked.json(), {
     error: 'proposal_owner_storage_limit_exceeded',
-    maxProposalStorageBytes: 1000,
+    maxProposalStorageBytes: ownerProposalStorageBudget(),
   });
 
   const profileId = 'p1';
-  const context = JSON.stringify({
-    encryptedContext: { version: 2, keyId: validProposalEnvelope().keyId, ciphertext: 'still-writable' },
-  });
+  const context = contextWithExactBytes(1000, validProposalEnvelope().keyId);
   const timestamp = Date.now();
   const signature = signContext({ profileId, context, timestamp });
   const contextWrite = await fetch(`http://127.0.0.1:${port}/api/context`, {

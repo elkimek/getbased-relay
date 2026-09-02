@@ -32,13 +32,6 @@ const PROPOSAL_RECEIPT_BYTES = Buffer.byteLength(JSON.stringify({
   tokenHash: '0'.repeat(64),
   acknowledgedAt: '2000-01-01T00:00:00.000Z',
 }), 'utf8');
-const OWNER_PROPOSAL_STORAGE_BUDGET_BYTES = Math.max(
-  0,
-  OWNER_QUOTA_BYTES - Math.min(MAX_CONTEXT_BYTES, OWNER_QUOTA_BYTES),
-);
-const MAX_TRACKED_PROPOSALS_PER_OWNER = Math.floor(
-  OWNER_PROPOSAL_STORAGE_BUDGET_BYTES / PROPOSAL_RECEIPT_BYTES,
-);
 const PROPOSAL_RETENTION_MS = Number(process.env.AGENT_PROPOSAL_RETENTION_MS || 24 * 60 * 60 * 1000);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
@@ -116,6 +109,17 @@ function writeOwner(ownerId, owner) {
 
 function contextBytes(contexts) {
   return Object.values(contexts || {}).reduce((n, value) => n + Buffer.byteLength(String(value || ''), 'utf8'), 0);
+}
+
+function ownerProposalStorageBudgetBytes(contexts) {
+  const sizes = Object.values(contexts || {}).map(
+    value => Buffer.byteLength(String(value || ''), 'utf8'),
+  );
+  const currentContextBytes = sizes.reduce((sum, size) => sum + size, 0);
+  const reservedContextBytes = sizes.length < MAX_PROFILES_PER_OWNER
+    ? currentContextBytes + MAX_CONTEXT_BYTES
+    : currentContextBytes - Math.min(...sizes) + MAX_CONTEXT_BYTES;
+  return Math.max(0, OWNER_QUOTA_BYTES - reservedContextBytes);
 }
 
 function proposalBytes(proposals) {
@@ -486,10 +490,12 @@ async function handlePostProposal(req, res, tokenHash) {
     return;
   }
   const trackedForOwner = owner.proposals.length + owner.proposalReceipts.length;
-  if (trackedForOwner >= MAX_TRACKED_PROPOSALS_PER_OWNER) {
+  const ownerProposalStorageBudget = ownerProposalStorageBudgetBytes(owner.contexts);
+  const maxTrackedProposalsForOwner = Math.floor(ownerProposalStorageBudget / PROPOSAL_RECEIPT_BYTES);
+  if (trackedForOwner >= maxTrackedProposalsForOwner) {
     json(res, 409, {
       error: 'proposal_owner_retention_limit_exceeded',
-      maxTrackedOwner: MAX_TRACKED_PROPOSALS_PER_OWNER,
+      maxTrackedOwner: maxTrackedProposalsForOwner,
     });
     return;
   }
@@ -501,10 +507,10 @@ async function handlePostProposal(req, res, tokenHash) {
   ];
   const nextProposalStorageBytes = proposalBytes(nextProposals)
     + proposalBytes(owner.proposalReceipts);
-  if (nextProposalStorageBytes > OWNER_PROPOSAL_STORAGE_BUDGET_BYTES) {
+  if (nextProposalStorageBytes > ownerProposalStorageBudget) {
     json(res, 409, {
       error: 'proposal_owner_storage_limit_exceeded',
-      maxProposalStorageBytes: OWNER_PROPOSAL_STORAGE_BUDGET_BYTES,
+      maxProposalStorageBytes: ownerProposalStorageBudget,
     });
     return;
   }
