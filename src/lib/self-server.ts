@@ -41,9 +41,10 @@
 // stateless HMAC scheme. Compaction is idempotent (a second call leaves the
 // owner empty) and storage is read-only, so replay is harmless.
 //
-// This server binds to 0.0.0.0 by default because it's intended to be
-// reachable from outside the host (typically via a reverse proxy like
-// Caddy with TLS termination). The /admin server stays on 127.0.0.1.
+// This server binds to 127.0.0.1 by default. Container deployments set
+// SELF_BIND=0.0.0.0 inside the container and publish the host port on
+// loopback so Caddy/nginx remains the only public entrypoint. The /admin
+// server always stays on 127.0.0.1.
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { createHmac, timingSafeEqual } from "crypto";
