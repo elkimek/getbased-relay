@@ -182,14 +182,17 @@ HTTP API for Agent Access. MCP servers and bot plugins use it to fetch encrypted
 
 ### How it works
 
-Agent Access storage is owner-bound, not token-bound:
+Agent Access context storage is owner-bound. Proposal queues are owner-mapped and token-scoped:
 
 - the browser encrypts context locally before upload;
-- the bearer token is only a read capability;
-- every write is HMAC-signed with the Evolu owner's `writeKey`;
-- the gateway sends the proof to a private relay verifier that returns only yes/no; the gateway never mounts the relay database and never receives a write key;
+- the bearer token authorizes context reads and ciphertext proposal submission for its already mapped owner;
+- every context write is HMAC-signed with the Evolu owner's `writeKey`; proposal submission cannot create or change an owner mapping;
+- the gateway sends context-write proofs to a private relay verifier that returns only yes/no; the gateway never mounts the relay database and never receives a write key;
 - token hashes map to owner IDs in `agent-token-map.json`;
 - per-owner limits cap profiles, active tokens, per-profile payload size, and total Agent Access storage.
+- proposal records contain only a strict AES-GCM envelope plus opaque proposal ID and server timestamp; the gateway never receives action plaintext;
+- each proposal ID is deterministically derived from its random AES-GCM IV, and the envelope key ID must match a context key already registered by the owner-signed browser context;
+- proposal IDs are idempotent per token, queues are bounded, and old records expire automatically.
 
 This prevents users from bypassing relay quota by generating unlimited random Agent Access tokens. Legacy token-hash files remain readable during rollout, but new writes require owner proof.
 
@@ -221,6 +224,13 @@ All endpoints require an Agent Access bearer token in the `Authorization` header
 | `GET /api/context` | — | Get the default profile's encrypted context for this token's owner mapping |
 | `GET /api/context?profile=<id>` | — | Get a specific profile's encrypted context |
 | `DELETE /api/context` | — | Revoke this token's owner mapping, signed with the same owner proof over an empty context |
+| `POST /api/agent-proposals` | — | Queue a strict ciphertext envelope for browser review. The opaque proposal ID must match the envelope IV and the key ID must already belong to this owner. Idempotent retries are accepted; conflicting retries are rejected. |
+| `GET /api/agent-proposals` | — | List this token's pending ciphertext envelopes |
+| `DELETE /api/agent-proposals/<proposalId>` | — | Acknowledge one proposal after durable browser ingestion |
+
+Proposal submission is not an execution API. The browser decrypts the envelope locally, revalidates profile, capability, expiry, action schema, and replay state, then requires explicit user approval before invoking an app-owned action.
+
+Proposal limits are configured with `AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES` (default 64 KiB ciphertext), `AGENT_PROPOSAL_MAX_PENDING` (default 20 per token), and `AGENT_PROPOSAL_RETENTION_MS` (default 24 hours).
 
 ### Docker Compose
 

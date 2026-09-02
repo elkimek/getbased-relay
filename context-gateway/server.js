@@ -22,6 +22,9 @@ const MAX_CONTEXT_BYTES = Number(process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES || 
 const OWNER_QUOTA_BYTES = Number(process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES || 5 * 1024 * 1024);
 const MAX_PROFILES_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_PROFILES || 20);
 const MAX_TOKENS_PER_OWNER = Number(process.env.AGENT_CONTEXT_MAX_TOKENS || 3);
+const MAX_PROPOSAL_CIPHERTEXT_BYTES = Number(process.env.AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES || 64 * 1024);
+const MAX_PENDING_PROPOSALS_PER_TOKEN = Number(process.env.AGENT_PROPOSAL_MAX_PENDING || 20);
+const PROPOSAL_RETENTION_MS = Number(process.env.AGENT_PROPOSAL_RETENTION_MS || 24 * 60 * 60 * 1000);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
 const RATE_LIMIT_PER_MINUTE = Number(process.env.CONTEXT_RATE_LIMIT_PER_MINUTE || 300);
 const CLIENT_IP_HEADER = /^[a-z0-9-]+$/i.test(process.env.CONTEXT_CLIENT_IP_HEADER || '')
@@ -77,9 +80,19 @@ function readOwner(ownerId) {
   if (parsed && typeof parsed === 'object') {
     if (!parsed.contexts || typeof parsed.contexts !== 'object' || Array.isArray(parsed.contexts)) parsed.contexts = {};
     if (!Array.isArray(parsed.tokens)) parsed.tokens = [];
+    if (!Array.isArray(parsed.proposals)) parsed.proposals = [];
+    if (!Array.isArray(parsed.proposalReceipts)) parsed.proposalReceipts = [];
     return parsed;
   }
-  return { ownerId, contexts: {}, profiles: null, tokens: [], updatedAt: null };
+  return {
+    ownerId,
+    contexts: {},
+    profiles: null,
+    tokens: [],
+    proposals: [],
+    proposalReceipts: [],
+    updatedAt: null,
+  };
 }
 
 function writeOwner(ownerId, owner) {
@@ -88,6 +101,83 @@ function writeOwner(ownerId, owner) {
 
 function contextBytes(contexts) {
   return Object.values(contexts || {}).reduce((n, value) => n + Buffer.byteLength(String(value || ''), 'utf8'), 0);
+}
+
+function proposalBytes(proposals) {
+  return (proposals || []).reduce(
+    (n, proposal) => n + Buffer.byteLength(JSON.stringify(proposal || {}), 'utf8'),
+    0,
+  );
+}
+
+function ownerStorageBytes(contexts, proposals, proposalReceipts = []) {
+  return contextBytes(contexts) + proposalBytes(proposals) + proposalBytes(proposalReceipts);
+}
+
+function isStrictBase64(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  try {
+    return Buffer.from(value, 'base64').toString('base64') === value;
+  } catch {
+    return false;
+  }
+}
+
+function proposalIdFromIv(iv) {
+  return `proposal_${createHash('sha256').update(iv).digest('base64url').slice(0, 24)}`;
+}
+
+function ownerContextKeyIds(owner) {
+  const keyIds = new Set();
+  for (const serialized of Object.values(owner?.contexts || {})) {
+    try {
+      const parsed = JSON.parse(String(serialized || ''));
+      const keyId = parsed?.encryptedContext?.keyId;
+      if (typeof keyId === 'string' && /^[A-Za-z0-9_-]{16}$/.test(keyId)) keyIds.add(keyId);
+    } catch {}
+  }
+  return keyIds;
+}
+
+function normalizeProposalEnvelope(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const allowed = ['version', 'alg', 'keyDerivation', 'keyId', 'proposalId', 'iv', 'ciphertext'];
+  const keys = Object.keys(value);
+  if (keys.length !== allowed.length || keys.some(key => !allowed.includes(key))) return null;
+  if (value.version !== 1 || value.alg !== 'AES-256-GCM' || value.keyDerivation !== 'raw-256-bit-key') return null;
+  if (typeof value.keyId !== 'string' || !/^[A-Za-z0-9_-]{16}$/.test(value.keyId)) return null;
+  if (typeof value.proposalId !== 'string' || !/^proposal_[A-Za-z0-9_-]{24}$/.test(value.proposalId)) return null;
+  if (!isStrictBase64(value.iv)) return null;
+  const iv = Buffer.from(value.iv, 'base64');
+  if (iv.length !== 12 || value.proposalId !== proposalIdFromIv(iv)) return null;
+  if (!isStrictBase64(value.ciphertext)) return null;
+  const ciphertextBytes = Buffer.from(value.ciphertext, 'base64').length;
+  if (ciphertextBytes < 17 || ciphertextBytes > MAX_PROPOSAL_CIPHERTEXT_BYTES) return null;
+  return {
+    version: 1,
+    alg: 'AES-256-GCM',
+    keyDerivation: 'raw-256-bit-key',
+    keyId: value.keyId,
+    proposalId: value.proposalId,
+    iv: value.iv,
+    ciphertext: value.ciphertext,
+  };
+}
+
+function pruneExpiredProposals(owner, now = Date.now()) {
+  const previousProposals = owner.proposals.length;
+  const previousReceipts = owner.proposalReceipts.length;
+  owner.proposals = owner.proposals.filter(proposal => {
+    const createdAt = Date.parse(proposal?.createdAt || '');
+    return Number.isFinite(createdAt) && now - createdAt <= PROPOSAL_RETENTION_MS;
+  });
+  owner.proposalReceipts = owner.proposalReceipts.filter(receipt => {
+    const acknowledgedAt = Date.parse(receipt?.acknowledgedAt || '');
+    return Number.isFinite(acknowledgedAt) && now - acknowledgedAt <= PROPOSAL_RETENTION_MS;
+  });
+  return owner.proposals.length !== previousProposals
+    || owner.proposalReceipts.length !== previousReceipts;
 }
 
 function decodeOwnerId(ownerId) {
@@ -297,7 +387,8 @@ async function handlePostContext(req, res, token, tokenHash) {
   }
 
   const nextContexts = { ...owner.contexts, [profileId]: data.context };
-  const nextBytes = contextBytes(nextContexts);
+  pruneExpiredProposals(owner);
+  const nextBytes = ownerStorageBytes(nextContexts, owner.proposals, owner.proposalReceipts);
   if (nextBytes > OWNER_QUOTA_BYTES) {
     json(res, 413, { error: 'owner_quota_exceeded', ownerBytes: nextBytes, quotaBytes: OWNER_QUOTA_BYTES });
     return;
@@ -312,6 +403,128 @@ async function handlePostContext(req, res, token, tokenHash) {
   tokenMap[tokenHash] = { ownerId, createdAt: existingMapping?.createdAt || owner.updatedAt, updatedAt: owner.updatedAt };
   writeTokenMap(tokenMap);
   json(res, 200, { ok: true, ownerId, ownerBytes: nextBytes, quotaBytes: OWNER_QUOTA_BYTES });
+}
+
+async function handlePostProposal(req, res, tokenHash) {
+  let data;
+  try {
+    const body = await readBody(req, Math.max(MAX_PROPOSAL_CIPHERTEXT_BYTES * 2, 32 * 1024));
+    data = JSON.parse(body);
+  } catch (e) {
+    const tooLarge = e?.message === 'payload_too_large';
+    json(res, tooLarge ? 413 : 400, { error: tooLarge ? 'proposal_too_large' : 'invalid_json' });
+    return;
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)
+      || Object.keys(data).length !== 1 || !Object.hasOwn(data, 'envelope')) {
+    json(res, 400, { error: 'invalid_proposal_envelope' });
+    return;
+  }
+  const envelope = normalizeProposalEnvelope(data.envelope);
+  if (!envelope) {
+    json(res, 400, { error: 'invalid_proposal_envelope' });
+    return;
+  }
+
+  const tokenMap = readTokenMap();
+  const mapping = tokenMap[tokenHash];
+  if (!mapping?.ownerId) {
+    json(res, 404, { error: 'agent_access_not_registered' });
+    return;
+  }
+  const owner = readOwner(mapping.ownerId);
+  if (!ownerContextKeyIds(owner).has(envelope.keyId)) {
+    json(res, 400, { error: 'invalid_proposal_envelope' });
+    return;
+  }
+  pruneExpiredProposals(owner);
+  const existing = owner.proposals.find(
+    proposal => proposal.tokenHash === tokenHash && proposal.proposalId === envelope.proposalId,
+  );
+  if (existing) {
+    const sameEnvelope = sha256Hex(JSON.stringify(existing.envelope)) === sha256Hex(JSON.stringify(envelope));
+    if (!sameEnvelope) {
+      json(res, 409, { error: 'proposal_id_conflict' });
+      return;
+    }
+    json(res, 200, { ok: true, proposalId: envelope.proposalId, duplicate: true });
+    return;
+  }
+  const acknowledged = owner.proposalReceipts.some(
+    receipt => receipt.tokenHash === tokenHash && receipt.proposalId === envelope.proposalId,
+  );
+  if (acknowledged) {
+    json(res, 200, { ok: true, proposalId: envelope.proposalId, duplicate: true });
+    return;
+  }
+  const pendingForToken = owner.proposals.filter(proposal => proposal.tokenHash === tokenHash).length;
+  if (pendingForToken >= MAX_PENDING_PROPOSALS_PER_TOKEN) {
+    json(res, 409, { error: 'proposal_limit_exceeded', maxPending: MAX_PENDING_PROPOSALS_PER_TOKEN });
+    return;
+  }
+
+  const createdAt = new Date().toISOString();
+  const nextProposals = [
+    ...owner.proposals,
+    { proposalId: envelope.proposalId, tokenHash, envelope, createdAt },
+  ];
+  const nextBytes = ownerStorageBytes(owner.contexts, nextProposals, owner.proposalReceipts);
+  if (nextBytes > OWNER_QUOTA_BYTES) {
+    json(res, 413, { error: 'owner_quota_exceeded', ownerBytes: nextBytes, quotaBytes: OWNER_QUOTA_BYTES });
+    return;
+  }
+  owner.proposals = nextProposals;
+  owner.updatedAt = createdAt;
+  owner.bytes = nextBytes;
+  writeOwner(mapping.ownerId, owner);
+  json(res, 201, { ok: true, proposalId: envelope.proposalId, duplicate: false });
+}
+
+function handleGetProposals(res, tokenHash) {
+  const tokenMap = readTokenMap();
+  const mapping = tokenMap[tokenHash];
+  if (!mapping?.ownerId) {
+    json(res, 404, { error: 'agent_access_not_registered' });
+    return;
+  }
+  const owner = readOwner(mapping.ownerId);
+  const pruned = pruneExpiredProposals(owner);
+  if (pruned) {
+    owner.bytes = ownerStorageBytes(owner.contexts, owner.proposals, owner.proposalReceipts);
+    writeOwner(mapping.ownerId, owner);
+  }
+  const proposals = owner.proposals
+    .filter(proposal => proposal.tokenHash === tokenHash)
+    .map(({ proposalId, envelope, createdAt }) => ({ proposalId, envelope, createdAt }))
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  json(res, 200, { proposals });
+}
+
+function handleDeleteProposal(res, tokenHash, proposalId) {
+  const tokenMap = readTokenMap();
+  const mapping = tokenMap[tokenHash];
+  if (!mapping?.ownerId) {
+    json(res, 200, { ok: true, deleted: false });
+    return;
+  }
+  const owner = readOwner(mapping.ownerId);
+  pruneExpiredProposals(owner);
+  const previous = owner.proposals.length;
+  owner.proposals = owner.proposals.filter(
+    proposal => !(proposal.tokenHash === tokenHash && proposal.proposalId === proposalId),
+  );
+  const deleted = owner.proposals.length !== previous;
+  if (deleted) {
+    owner.updatedAt = new Date().toISOString();
+    if (!owner.proposalReceipts.some(
+      receipt => receipt.tokenHash === tokenHash && receipt.proposalId === proposalId,
+    )) {
+      owner.proposalReceipts.push({ proposalId, tokenHash, acknowledgedAt: owner.updatedAt });
+    }
+    owner.bytes = ownerStorageBytes(owner.contexts, owner.proposals, owner.proposalReceipts);
+    writeOwner(mapping.ownerId, owner);
+  }
+  json(res, 200, { ok: true, deleted });
 }
 
 function handleGetContext(req, res, token, tokenHash, url) {
@@ -382,6 +595,8 @@ async function handleDeleteContext(req, res, tokenHash) {
   }
   const owner = readOwner(mapping.ownerId);
   owner.tokens = owner.tokens.filter(t => t !== tokenHash);
+  owner.proposals = owner.proposals.filter(proposal => proposal.tokenHash !== tokenHash);
+  owner.proposalReceipts = owner.proposalReceipts.filter(receipt => receipt.tokenHash !== tokenHash);
   delete tokenMap[tokenHash];
   if (owner.tokens.length === 0) {
     try { rmSync(ownerPath(mapping.ownerId), { force: true }); } catch {}
@@ -426,6 +641,22 @@ const server = createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/context') {
     handleGetContext(req, res, token, tokenHash, url);
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/agent-proposals') {
+    void handlePostProposal(req, res, tokenHash);
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/agent-proposals') {
+    handleGetProposals(res, tokenHash);
+    return;
+  }
+
+  const proposalDelete = url.pathname.match(/^\/api\/agent-proposals\/(proposal_[A-Za-z0-9_-]{6,112})$/);
+  if (req.method === 'DELETE' && proposalDelete) {
+    handleDeleteProposal(res, tokenHash, proposalDelete[1]);
     return;
   }
 
