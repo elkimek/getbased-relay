@@ -32,12 +32,12 @@ const PROPOSAL_RECEIPT_BYTES = Buffer.byteLength(JSON.stringify({
   tokenHash: '0'.repeat(64),
   acknowledgedAt: '2000-01-01T00:00:00.000Z',
 }), 'utf8');
-const OWNER_TRACKED_PROPOSAL_BUDGET_BYTES = Math.max(
+const OWNER_PROPOSAL_STORAGE_BUDGET_BYTES = Math.max(
   0,
   OWNER_QUOTA_BYTES - Math.min(MAX_CONTEXT_BYTES, OWNER_QUOTA_BYTES),
 );
 const MAX_TRACKED_PROPOSALS_PER_OWNER = Math.floor(
-  OWNER_TRACKED_PROPOSAL_BUDGET_BYTES / PROPOSAL_RECEIPT_BYTES,
+  OWNER_PROPOSAL_STORAGE_BUDGET_BYTES / PROPOSAL_RECEIPT_BYTES,
 );
 const PROPOSAL_RETENTION_MS = Number(process.env.AGENT_PROPOSAL_RETENTION_MS || 24 * 60 * 60 * 1000);
 const TIMESTAMP_WINDOW_MS = 5 * 60 * 1000;
@@ -499,6 +499,15 @@ async function handlePostProposal(req, res, tokenHash) {
     ...owner.proposals,
     { proposalId: envelope.proposalId, tokenHash, envelope, createdAt },
   ];
+  const nextProposalStorageBytes = proposalBytes(nextProposals)
+    + proposalBytes(owner.proposalReceipts);
+  if (nextProposalStorageBytes > OWNER_PROPOSAL_STORAGE_BUDGET_BYTES) {
+    json(res, 409, {
+      error: 'proposal_owner_storage_limit_exceeded',
+      maxProposalStorageBytes: OWNER_PROPOSAL_STORAGE_BUDGET_BYTES,
+    });
+    return;
+  }
   const nextBytes = ownerStorageBytes(owner.contexts, nextProposals, owner.proposalReceipts);
   if (nextBytes > OWNER_QUOTA_BYTES) {
     json(res, 413, { error: 'owner_quota_exceeded', ownerBytes: nextBytes, quotaBytes: OWNER_QUOTA_BYTES });

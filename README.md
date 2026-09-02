@@ -193,7 +193,7 @@ Agent Access context storage is owner-bound. Proposal queues are owner-mapped an
 - proposal records contain only a strict AES-GCM envelope plus opaque proposal ID and server timestamp; the gateway never receives action plaintext;
 - each proposal ID is deterministically derived from its random AES-GCM IV, and the envelope key ID must match a context key already registered by the owner-signed browser context;
 - proposal IDs are idempotent per token, queues are bounded, and old records expire automatically;
-- retained proposal IDs are bounded both per token and owner-wide: the owner-wide ceiling is derived from serialized receipt bytes and always reserves one maximum-size encrypted context inside the owner storage quota.
+- actual serialized pending envelopes plus acknowledgement receipts are bounded owner-wide so one maximum-size encrypted context remains reserved inside the owner storage quota; retained proposal IDs are additionally bounded per token and owner-wide.
 
 This prevents users from bypassing relay quota by generating unlimited random Agent Access tokens. Legacy token-hash files remain readable during rollout, but new writes require owner proof.
 
@@ -231,7 +231,7 @@ All endpoints require an Agent Access bearer token in the `Authorization` header
 
 Proposal submission is not an execution API. The browser decrypts the envelope locally, revalidates profile, capability, expiry, action schema, and replay state, then requires explicit user approval before invoking an app-owned action.
 
-Proposal limits are configured with `AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES` (default 64 KiB ciphertext), `AGENT_PROPOSAL_MAX_PENDING` (default 20 pending per token), `AGENT_PROPOSAL_MAX_TRACKED` (default 256 pending plus acknowledged IDs per token), and `AGENT_PROPOSAL_RETENTION_MS` (default 24 hours). The tracked-ID bound prevents an authorized token from cycling queue and acknowledgement requests until replay receipts consume the owner's shared storage quota.
+Proposal limits are configured with `AGENT_PROPOSAL_MAX_CIPHERTEXT_BYTES` (default 64 KiB ciphertext), `AGENT_PROPOSAL_MAX_PENDING` (default 20 pending per token), `AGENT_PROPOSAL_MAX_TRACKED` (default 256 pending plus acknowledged IDs per token), and `AGENT_PROPOSAL_RETENTION_MS` (default 24 hours). The relay also enforces an owner-wide serialized proposal-storage partition, so neither receipt cycling nor large pending ciphertext can consume the capacity reserved for a maximum-size context.
 
 ### Docker Compose
 

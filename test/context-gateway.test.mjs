@@ -75,7 +75,7 @@ before(async () => {
   process.env.CONTEXT_CLIENT_IP_HEADER = 'x-getbased-client-ip';
   process.env.CONTEXT_PORT = String(port);
   process.env.AGENT_CONTEXT_OWNER_QUOTA_BYTES = '2000';
-  process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1200';
+  process.env.AGENT_CONTEXT_MAX_PROFILE_BYTES = '1000';
   process.env.AGENT_CONTEXT_MAX_PROFILES = '3';
   process.env.AGENT_CONTEXT_MAX_TOKENS = '2';
   process.env.AGENT_PROPOSAL_MAX_TRACKED = '999';
@@ -271,7 +271,41 @@ test('an acknowledged proposal id cannot be queued again', async () => {
   assert.deepEqual((await remaining.json()).proposals, []);
 });
 
-test('owner byte quota bounds retained proposal ids below an oversized configured count', async () => {
+test('owner proposal byte reserve rejects a large pending envelope before context capacity is consumed', async () => {
+  const envelope = {
+    ...validProposalEnvelope(18),
+    ciphertext: Buffer.alloc(300, 7).toString('base64url'),
+  };
+  const rejected = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ envelope }),
+  });
+  assert.equal(rejected.status, 409);
+  assert.deepEqual(await rejected.json(), {
+    error: 'proposal_owner_storage_limit_exceeded',
+    maxProposalStorageBytes: 1000,
+  });
+
+  const profileId = 'p1';
+  const context = JSON.stringify({
+    encryptedContext: {
+      version: 2,
+      keyId: validProposalEnvelope().keyId,
+      ciphertext: 'still-writable-after-large-pending',
+    },
+  });
+  const timestamp = Date.now();
+  const signature = signContext({ profileId, context, timestamp });
+  const writable = await fetch(`http://127.0.0.1:${port}/api/context`, {
+    method: 'POST',
+    headers: { Authorization: bearer(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ownerId, profileId, context, timestamp, signature }),
+  });
+  assert.equal(writable.status, 200);
+});
+
+test('owner proposal storage limit preserves context capacity when configured count is too high', async () => {
   for (const ivByte of [12, 13]) {
     const envelope = validProposalEnvelope(ivByte);
     const created = await fetch(`http://127.0.0.1:${port}/api/agent-proposals`, {
@@ -294,8 +328,8 @@ test('owner byte quota bounds retained proposal ids below an oversized configure
   });
   assert.equal(blocked.status, 409);
   assert.deepEqual(await blocked.json(), {
-    error: 'proposal_owner_retention_limit_exceeded',
-    maxTrackedOwner: 4,
+    error: 'proposal_owner_storage_limit_exceeded',
+    maxProposalStorageBytes: 1000,
   });
 
   const profileId = 'p1';
