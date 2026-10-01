@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { statSync } from "fs";
 import { join } from "path";
+import { COMPACTION_REPLAY_TABLE } from "./compaction-replay.js";
 import type { RelayConfig } from "./config.js";
 import type { Logger } from "./logger.js";
 
@@ -139,9 +140,9 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
       const row = db!.prepare(`
         SELECT COUNT(*) AS count FROM sqlite_master
         WHERE type = 'table' AND name IN
-          ('evolu_timestamp', 'evolu_usage', 'evolu_writeKey', 'evolu_message')
-      `).get() as { count: number };
-      return row.count === 4;
+          ('evolu_timestamp', 'evolu_usage', 'evolu_writeKey', 'evolu_message', ?)
+      `).get(COMPACTION_REPLAY_TABLE) as { count: number };
+      return row.count === 5;
     } catch {
       return false;
     }

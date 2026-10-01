@@ -10,6 +10,7 @@ import { createOwnerTracker } from "../dist/lib/owner-tracker.js";
 import { createLogger } from "../dist/lib/logger.js";
 import { loadConfig } from "../dist/lib/config.js";
 import { withOwnerWriteLock } from "../dist/lib/owner-write-lock.js";
+import { ensureCompactionReplayTable } from "../dist/lib/compaction-replay.js";
 
 const logger = { emit() {} };
 const ownerId = Buffer.alloc(16, 1).toString("base64url");
@@ -49,6 +50,8 @@ test("metrics and owner activity use the same IDs; strict quota reads expose DB 
     tracker.trackOwner(ownerId);
     assert.ok(tracker.getActivity()[metrics.getPerOwnerUsage()[0].ownerId]);
     assert.deepEqual(metrics.getQuotaUsage(ownerId), { totalStoredBytes: 990, ownerStoredBytes: 90 });
+    assert.equal(metrics.isReady(), false, "Evolu tables alone cannot serve replay-protected writes");
+    ensureCompactionReplayTable(db);
     assert.equal(metrics.isReady(), true);
     db.exec("DROP TABLE evolu_usage");
     assert.equal(metrics.isReady(), false);

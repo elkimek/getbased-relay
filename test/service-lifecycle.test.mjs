@@ -9,6 +9,7 @@ import { test } from "node:test";
 import Database from "better-sqlite3";
 import { WebSocket } from "ws";
 import { createProtocolMessageBuffer, MessageType } from "@evolu/common/local-first";
+import { COMPACTION_REPLAY_TABLE, ensureCompactionReplayTable } from "../dist/lib/compaction-replay.js";
 
 async function unusedPorts() {
   const servers = [createServer(), createServer()];
@@ -66,6 +67,12 @@ test("service reports readiness, preserves data across restart, and shuts down c
     const badToken = await fetch(`http://127.0.0.1:${adminPort}/metrics`, { headers: { Authorization: `Bearer ${"é".repeat(10)}` } });
     assert.equal(badToken.status, 401);
     const db = new Database(join(dir, "relay.db"));
+    db.exec(`DROP TABLE ${COMPACTION_REPLAY_TABLE}`);
+    const missingReplay = await fetch(`http://127.0.0.1:${adminPort}/health`);
+    assert.equal(missingReplay.status, 503);
+    assert.equal((await missingReplay.json()).status, "unhealthy");
+    ensureCompactionReplayTable(db);
+    assert.equal((await fetch(`http://127.0.0.1:${adminPort}/health`)).status, 200);
     db.exec("DROP TABLE evolu_timestamp"); db.close();
     assert.equal((await fetch(`http://127.0.0.1:${adminPort}/health`)).status, 503);
     running.child.kill("SIGTERM"); assert.deepEqual(await running.exited, [0, null]); running = null;
