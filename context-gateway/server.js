@@ -236,14 +236,19 @@ function readBody(req, maxBytes) {
   });
 }
 
+async function readJsonObject(req, maxBytes, allowEmpty = false) {
+  const body = await readBody(req, maxBytes);
+  const data = allowEmpty && !body ? {} : JSON.parse(body);
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('invalid_json');
+  }
+  return data;
+}
+
 async function handlePostContext(req, res, token, tokenHash) {
   let data;
   try {
-    const body = await readBody(req, Math.max(MAX_CONTEXT_BYTES + 4096, 32 * 1024));
-    data = JSON.parse(body);
-    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
-      throw new Error('invalid_json');
-    }
+    data = await readJsonObject(req, Math.max(MAX_CONTEXT_BYTES + 4096, 32 * 1024));
   } catch (e) {
     const msg = e?.message === 'payload_too_large' ? 'Payload too large' : 'Invalid JSON';
     json(res, e?.message === 'payload_too_large' ? 413 : 400, { error: msg });
@@ -356,13 +361,9 @@ function handleGetContext(req, res, token, tokenHash, url) {
 }
 
 async function handleDeleteContext(req, res, tokenHash) {
-  let data = {};
+  let data;
   try {
-    const body = await readBody(req, 4096);
-    data = body ? JSON.parse(body) : {};
-    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
-      throw new Error('invalid_json');
-    }
+    data = await readJsonObject(req, 4096, true);
   } catch {
     json(res, 400, { error: 'Invalid JSON' });
     return;
