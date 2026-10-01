@@ -22,7 +22,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 - Pin both Docker images to Node.js 24.21.0 LTS and keep automated Docker updates within that major.
 - Update Node.js development types to 24.13.4 and the CodeQL action to 4.38.2.
-- Run the regression suite in the production relay image and smoke-test the gateway image in CI.
+- Run the regression suite in the production relay image and verify the gateway image's context upload, persistence, read, and revocation in CI.
 - Update the locked Evolu core to `@evolu/common` 8.14.0 and Node adapter to 4.1.0, matching upstream relay 4.1.3.
 - Port upstream WebSocket heartbeats, the 16 MiB unsent broadcast limit, and shutdown guards into the replay-protected adapter.
 - Use upstream `runMain` for signal handling and fatal exit status; validate configured ports and reject truncated integer settings.

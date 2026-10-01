@@ -52,22 +52,12 @@ jobs:
       - name: Build gateway image
         run: docker build -t getbased-context-gateway:ci context-gateway
 
-      - name: Check gateway startup and request validation
+      - name: Check gateway startup and verified context lifecycle
         run: |
-          docker run -d --name context-gateway-ci getbased-context-gateway:ci
-          trap 'docker rm -f context-gateway-ci' EXIT
-          docker exec context-gateway-ci node --input-type=module -e '
-            import assert from "node:assert/strict";
-            let response;
-            for (let attempt = 0; attempt < 50; attempt++) {
-              try { response = await fetch("http://127.0.0.1:4001/health"); break; }
-              catch { await new Promise(resolve => setTimeout(resolve, 100)); }
-            }
-            assert.equal(response?.status, 200);
-            const invalid = await fetch("http://127.0.0.1:4001/api/context", {
-              method: "POST",
-              headers: { Authorization: "Bearer synthetic-ci-token", "Content-Type": "application/json" },
-              body: "null",
-            });
-            assert.equal(invalid.status, 400);
-          '
+          docker run -d --name context-gateway-ci \
+            -e CONTEXT_VERIFIER_SOCKET=/run/getbased-verifier/ci.sock \
+            -e CONTEXT_VERIFIER_TOKEN=synthetic-ci-verifier-token \
+            --mount "type=bind,src=$PWD/scripts/check-gateway-image.mjs,dst=/tmp/check-gateway-image.mjs,readonly" \
+            getbased-context-gateway:ci
+          trap 'docker logs context-gateway-ci; docker rm -f context-gateway-ci' EXIT
+          docker exec context-gateway-ci node /tmp/check-gateway-image.mjs
