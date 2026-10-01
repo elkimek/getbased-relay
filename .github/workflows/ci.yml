@@ -23,8 +23,8 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Type-check + build
-        run: npm run build
+      - name: Type-check, build, and test
+        run: npm test
 
       - name: Verify dist/ output
         # Sanity: tsc should emit at least the entrypoint. Catches a silent

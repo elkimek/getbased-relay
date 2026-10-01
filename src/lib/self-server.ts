@@ -123,7 +123,7 @@ function decodeOwnerId(s: string | null | undefined): Buffer | null {
   if (!/^[A-Za-z0-9_-]{22}$/.test(s)) return null;
   try {
     const buf = Buffer.from(s, "base64url");
-    if (buf.length !== 16) return null;
+    if (buf.length !== 16 || buf.toString("base64url") !== s) return null;
     return buf;
   } catch {
     return null;
@@ -200,7 +200,11 @@ function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
     req.on("end", () => {
       try {
         const text = Buffer.concat(chunks).toString("utf8");
-        resolve(JSON.parse(text) as T);
+        const body: unknown = JSON.parse(text);
+        if (body === null || typeof body !== "object" || Array.isArray(body)) {
+          throw new Error("invalid_json");
+        }
+        resolve(body as T);
       } catch (e) {
         reject(e as Error);
       }
@@ -508,7 +512,12 @@ export function createSelfServer(
     res.setHeader("Access-Control-Allow-Origin", "*");
 
     if (req.method === "POST" && url.pathname === "/self/compact-owner") {
-      void handleCompactOwner(req, res);
+      void handleCompactOwner(req, res).catch((error: unknown) => {
+        logger.emit("error", "self.request_failed", { error: String(error) });
+        if (!res.headersSent && !res.destroyed) {
+          jsonResponse(res, 500, { error: "request_failed" });
+        }
+      });
       return;
     }
     if (req.method === "GET" && url.pathname === "/self/owner-storage") {

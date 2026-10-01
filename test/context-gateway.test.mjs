@@ -164,6 +164,18 @@ test('owner token and profile limits are enforced', async () => {
   assert.equal(body3.error, 'profile_limit_exceeded');
 });
 
+test('context routes reject non-object JSON and continue serving health', async () => {
+  for (const method of ['POST', 'DELETE']) {
+    for (const body of ['null', '[]', 'true', '42', '"text"']) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/context`, {
+        method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body,
+      });
+      assert.equal(response.status, 400);
+    }
+  }
+  assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+});
+
 test('health endpoint works without token for docker healthchecks', async () => {
   const res = await fetch(`http://127.0.0.1:${port}/health`);
   assert.equal(res.status, 200);

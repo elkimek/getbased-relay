@@ -8,25 +8,21 @@ Built for [getbased](https://github.com/elkimek/get-based), a blood work dashboa
 
 ## Evolu compatibility
 
-Evolu is an npm dependency here, not vendored source. The v2 relay targets the latest Evolu 8 packages: `@evolu/common` 8.9.0 and `@evolu/nodejs` 3.2.0. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build.
+Evolu is an npm dependency here, not vendored source. The current checkout targets `@evolu/common` 8.14.0 and `@evolu/nodejs` 4.1.0, matching the core packages in upstream relay 4.1.3. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build.
 
 | Relay | `@evolu/common` | `@evolu/nodejs` | Node.js |
 |---|---:|---:|---:|
+| Unreleased | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
 | v2.0.0 | `^8.9.0` (locked to 8.9.0) | `^3.2.0` (locked to 3.2.0) | >= 24.20.0 |
 | v1.2.3 | `^7.4.0` | `^2.4.0` | >= 22.0.0 |
 
-The package version streams are independent: Evolu 8 uses the 8.x `common` package and the 3.x `nodejs` adapter.
+The package version streams are independent: Evolu 8 uses the 8.x `common` package; the current Node adapter is 4.x. This relay upgrade preserves the existing WebSocket protocol, owner keys, relay tables, self-service response fields, and Agent Access proof format. It does not require an application or browser Evolu upgrade.
+
+The mirrored WebSocket adapter retains GetBased's storage decorator and incorporates upstream's 30-second heartbeats, 16 MiB unsent broadcast limit, and shutdown guards. Explicit optional tooling overrides avoid the Node adapter's conflicting lint peer resolutions; SQLite install scripts are allowed for npm versions that require an allowlist.
 
 ## Why
 
-The official Evolu relay works but lacks operational tooling:
-
-- **Logging** is all-or-nothing (silent or raw SQL dump)
-- **Quota** is hardcoded at 1MB (too small for real use)
-- **No health endpoint** (health probes cause WebSocket errors)
-- **No metrics** (can't see owner count, storage usage, connections)
-
-This wrapper fixes all of that without forking the Evolu monorepo.
+Upstream now provides configurable per-owner quotas and leveled console output. This wrapper adds global payload admission checks, JSON operational events, database readiness and metrics, replay-protected compaction, signed owner self-service endpoints, and the optional Agent Access gateway without forking the Evolu monorepo.
 
 See [evoluhq/evolu#661](https://github.com/evoluhq/evolu/issues/661) for the full writeup.
 
@@ -85,7 +81,7 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `RELAY_NAME` | `evolu-relay` | SQLite database filename, without `.db` |
 | `DATA_DIR` | `./data` | Relay database and metadata directory |
 | `QUOTA_PER_OWNER_MB` | `10` | Max stored bytes per identity |
-| `QUOTA_GLOBAL_MB` | `1000` | Max total stored bytes |
+| `QUOTA_GLOBAL_MB` | `1000` | Max total live encrypted payload bytes; excludes SQLite overhead, compaction tombstones, and Context Gateway files |
 | `OWNER_TTL_DAYS` | `90` | Days before owner flagged as stale |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_FORMAT` | `json` | `json` or `text` |
@@ -102,7 +98,7 @@ transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
 
 **Admin port** (default 4001, localhost only) — HTTP endpoints:
 
-- `GET /health` — Always public. Returns `{"status":"ok","uptime":...}`
+- `GET /health` — Always public. Returns `{"status":"ok","uptime":...,"version":...}` when the relay Run is active and its database has the required tables; returns `503` with `status: "unhealthy"` otherwise. It is a readiness check, not an end-to-end sync probe.
 - `GET /metrics` — Requires the admin bearer token when `ADMIN_TOKEN` is configured. Returns owner count, per-owner storage, DB size, connection count, and quota settings.
 - `POST /compact-owner?ownerId=<base64url-22-char>` — Requires the admin bearer token. Replaces every relay message with a small exact-timestamp replay tombstone and clears the owner's live usage. A stale or offline paired client can reconnect safely: replayed history is acknowledged but not stored, while timestamps the relay has never compacted remain valid new writes. Response body: `{ownerId, deletedMessages, protectedTimestamps, beforeStoredBytes, afterStoredBytes}`.
 
@@ -239,6 +235,10 @@ docker compose up -d
 ```
 
 ## Releases
+
+For the unreleased upstream upgrade, back up the relay volume before rebuilding. Preserve the current environment variables and proxy routes; no database migration, owner-key rotation, or browser package update is needed. Global quota admission now checks the projected payload total on every write and rejects writes when usage cannot be read. Run one relay process per database; the in-process compaction locks and admission checks do not coordinate multiple relay processes.
+
+`npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
 
 See [CHANGELOG.md](CHANGELOG.md) for the versioned history and upgrade notes. GitHub release pages should be cut from the matching version commit; the package version, changelog entry, and tag must agree.
 

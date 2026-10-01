@@ -94,7 +94,7 @@ function decodeOwnerId(ownerId) {
   if (typeof ownerId !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(ownerId)) return null;
   try {
     const buf = Buffer.from(ownerId, 'base64url');
-    return buf.length === 16 ? buf : null;
+    return buf.length === 16 && buf.toString('base64url') === ownerId ? buf : null;
   } catch {
     return null;
   }
@@ -241,6 +241,9 @@ async function handlePostContext(req, res, token, tokenHash) {
   try {
     const body = await readBody(req, Math.max(MAX_CONTEXT_BYTES + 4096, 32 * 1024));
     data = JSON.parse(body);
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('invalid_json');
+    }
   } catch (e) {
     const msg = e?.message === 'payload_too_large' ? 'Payload too large' : 'Invalid JSON';
     json(res, e?.message === 'payload_too_large' ? 413 : 400, { error: msg });
@@ -357,6 +360,9 @@ async function handleDeleteContext(req, res, tokenHash) {
   try {
     const body = await readBody(req, 4096);
     data = body ? JSON.parse(body) : {};
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('invalid_json');
+    }
   } catch {
     json(res, 400, { error: 'Invalid JSON' });
     return;
@@ -420,7 +426,10 @@ const server = createServer((req, res) => {
   const tokenHash = sha256Hex(token);
 
   if (req.method === 'POST' && url.pathname === '/api/context') {
-    void handlePostContext(req, res, token, tokenHash);
+    void handlePostContext(req, res, token, tokenHash).catch(error => {
+      console.error('Context upload failed:', error);
+      if (!res.headersSent && !res.destroyed) json(res, 500, { error: 'request_failed' });
+    });
     return;
   }
 
@@ -430,7 +439,10 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === 'DELETE' && url.pathname === '/api/context') {
-    void handleDeleteContext(req, res, tokenHash);
+    void handleDeleteContext(req, res, tokenHash).catch(error => {
+      console.error('Context revocation failed:', error);
+      if (!res.headersSent && !res.destroyed) json(res, 500, { error: 'request_failed' });
+    });
     return;
   }
 

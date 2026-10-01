@@ -13,6 +13,9 @@ export interface Metrics {
   getOwnerCount: () => number;
   getPerOwnerUsage: () => OwnerUsage[];
   getTotalStoredBytes: () => number;
+  /** Strict, single-snapshot read for admission checks; never falls back to zero. */
+  getQuotaUsage: (ownerId: string) => { totalStoredBytes: number; ownerStoredBytes: number };
+  isReady: () => boolean;
   getDbFileSize: () => number;
   close: () => void;
 }
@@ -61,10 +64,10 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
     }
   }
 
-  function ownerIdToHex(ownerId: unknown): string {
+  function ownerIdToString(ownerId: unknown): string {
     if (!ownerId) return "<unknown>";
     if (typeof ownerId === "string") return ownerId;
-    return Buffer.from(ownerId as Uint8Array).toString("hex");
+    return Buffer.from(ownerId as Uint8Array).toString("base64url");
   }
 
   function getOwnerCount(): number {
@@ -89,7 +92,7 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
             .prepare('SELECT "ownerId", "storedBytes" FROM evolu_usage')
             .all() as Array<{ ownerId: unknown; storedBytes: number }>
         ).map((r) => ({
-          ownerId: ownerIdToHex(r.ownerId),
+          ownerId: ownerIdToString(r.ownerId),
           storedBytes: r.storedBytes,
         })),
       [],
@@ -118,6 +121,32 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
     }
   }
 
+  function getQuotaUsage(ownerId: string) {
+    if (!ensureDb()) throw new Error("Relay usage database unavailable");
+    return db!.prepare(`
+      SELECT COALESCE(SUM("storedBytes"), 0) AS totalStoredBytes,
+        COALESCE((SELECT "storedBytes" FROM evolu_usage WHERE "ownerId" = ?), 0)
+          AS ownerStoredBytes
+      FROM evolu_usage
+    `).get(Buffer.from(ownerId, "base64url")) as {
+      totalStoredBytes: number; ownerStoredBytes: number;
+    };
+  }
+
+  function isReady(): boolean {
+    if (!ensureDb()) return false;
+    try {
+      const row = db!.prepare(`
+        SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE type = 'table' AND name IN
+          ('evolu_timestamp', 'evolu_usage', 'evolu_writeKey', 'evolu_message')
+      `).get() as { count: number };
+      return row.count === 4;
+    } catch {
+      return false;
+    }
+  }
+
   function close(): void {
     if (db) {
       try {
@@ -131,6 +160,8 @@ export function createMetrics(config: RelayConfig, logger: Logger): Metrics {
     getOwnerCount,
     getPerOwnerUsage,
     getTotalStoredBytes,
+    getQuotaUsage,
+    isReady,
     getDbFileSize,
     close,
   };

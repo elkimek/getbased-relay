@@ -29,15 +29,16 @@ export function createAdminServer(
   logger: Logger,
   metrics: Metrics,
   ownerTracker: OwnerTracker,
+  isReady: () => boolean = () => metrics.isReady(),
 ) {
   const startTime = Date.now();
 
   function checkAuth(req: IncomingMessage): boolean {
     if (!config.adminToken) return true;
-    const provided = req.headers.authorization ?? "";
-    const expected = `Bearer ${config.adminToken}`;
+    const provided = Buffer.from(req.headers.authorization ?? "");
+    const expected = Buffer.from(`Bearer ${config.adminToken}`);
     if (provided.length !== expected.length) return false;
-    return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+    return timingSafeEqual(provided, expected);
   }
 
   // Stricter auth for mutating routes: ALWAYS require a configured ADMIN_TOKEN.
@@ -51,10 +52,11 @@ export function createAdminServer(
   }
 
   function handleHealth(_req: IncomingMessage, res: ServerResponse): void {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    const ready = isReady();
+    res.writeHead(ready ? 200 : 503, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
-        status: "ok",
+        status: ready ? "ok" : "unhealthy",
         uptime: Math.floor((Date.now() - startTime) / 1000),
         version: pkg.version,
       }),
@@ -87,7 +89,9 @@ export function createAdminServer(
     let ownerId: Buffer;
     try {
       ownerId = Buffer.from(ownerIdStr, "base64url");
-      if (ownerId.length !== 16) throw new Error("decoded length != 16");
+      if (ownerId.length !== 16 || ownerId.toString("base64url") !== ownerIdStr) {
+        throw new Error("ownerId must be canonical base64url");
+      }
     } catch (e) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(

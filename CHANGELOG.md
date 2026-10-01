@@ -2,6 +2,34 @@
 
 Notable changes to getbased-relay are documented here. The project follows Semantic Versioning.
 
+## Unreleased
+
+### Security
+
+- Reject non-object JSON on self-service, verifier, and Agent Access routes and handle asynchronous request failures without crashing the service.
+- Reject noncanonical owner IDs and normalize the owner write-lock identity to decoded bytes.
+- Compare bearer token byte lengths before timing-safe comparison.
+
+### Fixed
+
+- Filter compacted replay timestamps from broadcasts as well as persistence, with fresh broadcasts sent under the owner write lock after a successful commit.
+- Enforce the projected global live-payload total on every write, fail closed if usage is unavailable, and allow the exact per-owner quota boundary.
+- Use consistent base64url owner IDs for usage metrics and owner activity.
+- Preserve upstream console error levels and scopes, and keep raw diagnostic output behind `ENABLE_EVOLU_LOGGING`.
+- Report database readiness from `/health`; clean up all service resources on shutdown or fatal defects.
+
+### Changed
+
+- Update the locked Evolu core to `@evolu/common` 8.14.0 and Node adapter to 4.1.0, matching upstream relay 4.1.3.
+- Port upstream WebSocket heartbeats, the 16 MiB unsent broadcast limit, and shutdown guards into the replay-protected adapter.
+- Use upstream `runMain` for signal handling and fatal exit status; validate configured ports and reject truncated integer settings.
+- Run the regression suite in CI and cover existing Evolu 8.7 wire requests, malformed bodies, replay broadcasts, quotas, heartbeats, readiness, and process restart/shutdown.
+
+### Upgrade notes
+
+- Preserve the existing database volume, owner keys, environment settings, and HTTP/proxy routes. The current GetBased browser packages do not need to change for this upgrade.
+- Back up the relay volume before deployment. Global quota covers live encrypted payload bytes, not physical disk usage or tombstones; run one relay process per database.
+
 ## [2.0.0] - 2026-09-02
 
 ### Breaking changes

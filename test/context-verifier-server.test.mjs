@@ -103,6 +103,20 @@ test("validates the unchanged Agent Access HMAC contract", async () => {
   assert.deepEqual(await response.json(), { ok: true });
 });
 
+test("rejects non-object JSON without stopping the verifier", async () => {
+  for (const body of [null, [], true, 42, "text"]) {
+    const response = await verify(body);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { ok: false });
+  }
+  assert.equal((await verify(signedBody())).status, 200);
+});
+
+test("multibyte bearer input fails authorization without throwing", async () => {
+  const response = await verify(signedBody(), "é".repeat("verifier-test-token".length));
+  assert.equal(response.status, 401);
+});
+
 test("rejects wrong caller bearer and wrong owner proof uniformly", async () => {
   const wrongBearer = await verify(signedBody(), "wrong-token");
   assert.equal(wrongBearer.status, 401);

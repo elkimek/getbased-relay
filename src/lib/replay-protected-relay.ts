@@ -3,6 +3,8 @@
 // replay guard directly around the upstream SQLite storage. Protocol parsing,
 // reconciliation, encryption, persistence, and task lifetimes remain Evolu
 // implementations.
+// Adapter safeguards are aligned with @evolu/nodejs 4.1.0 in Evolu relay
+// 4.1.3 (4c01beb0): heartbeat activity, broadcast backlog, and shutdown guards.
 
 import {
   assert,
@@ -11,8 +13,11 @@ import {
   daemon,
   Name,
   ok,
+  Port,
+  type PositiveDuration,
   type OwnerId,
   type Task,
+  type TimeoutId,
   tryAsync,
   Uint8Array as EvoluUint8Array,
 } from "@evolu/common";
@@ -21,7 +26,9 @@ import {
   createBaseSqliteStorageTables,
   createRelaySqliteStorage,
   createRelayStorageTables,
+  createProtocolMessageBuffer,
   defaultProtocolMessageMaxSize,
+  MessageType,
   parseOwnerIdFromOwnerWebSocketTransportUrl,
   type ApplyProtocolMessageAsRelayOptions,
   type Relay,
@@ -36,7 +43,8 @@ import { createCompactionReplayGuard } from "./compaction-replay.js";
 import type { Logger } from "./logger.js";
 
 export interface ReplayProtectedRelayConfig extends RelayConfig {
-  readonly port?: number;
+  readonly port?: Port;
+  readonly pingInterval?: PositiveDuration;
   /** Retained for deployment compatibility; Logger applies the actual level. */
   readonly enableLogging?: boolean;
 }
@@ -48,10 +56,11 @@ interface LoggerDep {
 type ReplayProtectedRelayDeps = RelayDeps & LoggerDep;
 
 export const createReplayProtectedRelay = ({
-  port = 443,
+  port = Port.orThrow(443),
   name = Name.orThrow("evolu-relay"),
   isOwnerAllowed,
   isOwnerWithinQuota,
+  pingInterval = "30s",
 }: ReplayProtectedRelayConfig): Task<Relay, never, ReplayProtectedRelayDeps> =>
   async (run) => {
     await using disposer = new AsyncDisposableStack();
@@ -75,6 +84,11 @@ export const createReplayProtectedRelay = ({
     );
     const storage = replayGuard.storage;
     const relayRun = disposer.use(run.create({ storage }));
+    const activeSockets = new WeakSet<WebSocket>();
+    const unsentBroadcastBytesBySocket = new WeakMap<WebSocket, number>();
+    const maxUnsentBroadcastBytes = 16 * defaultProtocolMessageMaxSize;
+    let pingTimeoutId: TimeoutId | null = null;
+    let isDisposing = false;
 
     const server = disposer.use(createServer());
     server.once("close", () => {
@@ -96,13 +110,42 @@ export const createReplayProtectedRelay = ({
     );
     const ownerSocketRelation = createRelation<OwnerId, WebSocket>();
 
+    // Mirrors @evolu/nodejs 4.1.0: incoming data counts as activity, and
+    // buffered replies delay pinging so slow uploads/downloads stay connected.
+    const pingClients = (): void => {
+      for (const client of wss.clients) {
+        if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 0) continue;
+        if (!activeSockets.has(client)) {
+          relayConsole.debug("[relay]", "unresponsive connection");
+          client.terminate();
+          continue;
+        }
+        activeSockets.delete(client);
+        client.ping();
+      }
+      pingTimeoutId = run.deps.time.setTimeout(pingClients, pingInterval);
+    };
+    pingTimeoutId = run.deps.time.setTimeout(pingClients, pingInterval);
+    disposer.defer(() => {
+      if (pingTimeoutId !== null) run.deps.time.clearTimeout(pingTimeoutId);
+    });
+
     server.on("upgrade", (request, socket, head) => {
       const onSocketError = (error: Error) => {
         relayConsole.warn("[relay]", "socket error", { error: error.message });
       };
       socket.on("error", onSocketError);
 
+      if (isDisposing || relayRun.signal.aborted) {
+        socket.destroy();
+        return;
+      }
+
       const completeUpgrade = () => {
+        if (isDisposing || relayRun.signal.aborted || socket.destroyed) {
+          socket.destroy();
+          return;
+        }
         socket.removeListener("error", onSocketError);
         wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit("connection", ws, request);
@@ -172,10 +215,16 @@ export const createReplayProtectedRelay = ({
           return;
         }
         completeUpgrade();
-      })();
+      })().catch((error: unknown) => {
+        relayConsole.error("[relay]", "authorization error", { error: String(error) });
+        respondAndDestroy("503 Service Unavailable");
+      });
     });
 
-    wss.on("connection", (ws) => {
+    wss.on("connection", (ws, request) => {
+      activeSockets.add(ws);
+      const markActive = () => activeSockets.add(ws);
+      request.socket.on("data", markActive);
       relayConsole.log("[relay]", "connection", {
         totalConnectionCount: wss.clients.size,
       });
@@ -184,6 +233,28 @@ export const createReplayProtectedRelay = ({
         relayConsole.warn("[relay]", "socket error", { error: error.message });
       });
 
+      const broadcast = (ownerId: OwnerId, message: Uint8Array): void => {
+        let broadcastCount = 0;
+        for (const socket of ownerSocketRelation.iterateB(ownerId)) {
+          if (socket === ws || socket.readyState !== WebSocket.OPEN) continue;
+          const unsent = (unsentBroadcastBytesBySocket.get(socket) ?? 0) + message.byteLength;
+          if (unsent > maxUnsentBroadcastBytes) {
+            relayConsole.debug("[relay]", "broadcast backlog exceeded", { ownerId });
+            socket.terminate();
+            continue;
+          }
+          unsentBroadcastBytesBySocket.set(socket, unsent);
+          socket.send(message, { binary: true }, () => {
+            unsentBroadcastBytesBySocket.set(socket,
+              (unsentBroadcastBytesBySocket.get(socket) ?? 0) - message.byteLength);
+          });
+          broadcastCount++;
+        }
+        relayConsole.debug("[relay]", "broadcast", {
+          ownerId, broadcastCount,
+          subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
+        });
+      };
       const options: ApplyProtocolMessageAsRelayOptions = {
         subscribe: (ownerId) => {
           ownerSocketRelation.add(ownerId, ws);
@@ -199,30 +270,27 @@ export const createReplayProtectedRelay = ({
             subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
           });
         },
-        broadcast: (ownerId, message) => {
-          let broadcastCount = 0;
-          for (const socket of ownerSocketRelation.iterateB(ownerId)) {
-            if (socket !== ws && socket.readyState === WebSocket.OPEN) {
-              socket.send(message, { binary: true });
-              broadcastCount++;
-            }
-          }
-          relayConsole.debug("[relay]", "broadcast", {
-            ownerId,
-            broadcastCount,
-            subscriptionCount: ownerSocketRelation.bCountForA(ownerId),
-          });
-        },
+        // The storage guard broadcasts accepted messages while holding the
+        // owner lock; the protocol's unfiltered broadcast is deliberately off.
       };
 
       ws.on("message", (message) => {
-        if (!EvoluUint8Array.is(message)) return;
+        if (isDisposing || relayRun.signal.aborted || !EvoluUint8Array.is(message)) return;
         relayConsole.debug("[relay]", "on message", {
           length: message.length,
         });
 
         void (async () => {
-          const response = await relayRun.abortable(
+          await using messageRun = relayRun.create({
+            storage: replayGuard.withBroadcast((ownerId, messages) => {
+              const frame = createProtocolMessageBuffer(ownerId, {
+                messageType: MessageType.Broadcast,
+              });
+              for (const accepted of messages) frame.addMessage(accepted);
+              broadcast(ownerId, frame.unwrap());
+            }),
+          });
+          const response = await messageRun.abortable(
             applyProtocolMessageAsRelay(message, options),
           );
           if (!response.ok) {
@@ -232,6 +300,7 @@ export const createReplayProtectedRelay = ({
             });
             return;
           }
+          if (isDisposing || ws.readyState !== WebSocket.OPEN) return;
           ws.send(response.value.message, { binary: true });
           relayConsole.debug("[relay]", "responseLength", {
             length: response.value.message.length,
@@ -246,6 +315,7 @@ export const createReplayProtectedRelay = ({
       });
 
       ws.on("close", () => {
+        request.socket.removeListener("data", markActive);
         ownerSocketRelation.removeByB(ws);
         relayConsole.log("[relay]", "close", {
           totalConnectionCount: wss.clients.size,
@@ -254,6 +324,7 @@ export const createReplayProtectedRelay = ({
     });
 
     disposer.defer(() => {
+      isDisposing = true;
       relayConsole.log("Shutting down Evolu Relay");
       for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {

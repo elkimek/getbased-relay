@@ -10,6 +10,8 @@ export async function withOwnerWriteLock<T>(
   ownerId: string,
   task: () => T | Promise<T>,
 ): Promise<T> {
+  // Use bytes as the lock identity even if a caller supplied a base64url alias.
+  ownerId = Buffer.from(ownerId, "base64url").toString("hex");
   const previous = ownerTails.get(ownerId) ?? Promise.resolve();
   let release: () => void = () => {};
   const turn = new Promise<void>((resolve) => {

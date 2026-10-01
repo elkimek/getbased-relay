@@ -1,4 +1,5 @@
 import { resolve } from "path";
+import { Port } from "@evolu/common";
 
 export interface RelayConfig {
   relayPort: number;
@@ -25,10 +26,14 @@ export interface RelayConfig {
 function envInt(key: string, fallback: number): number {
   const val = process.env[key];
   if (val === undefined) return fallback;
-  const n = parseInt(val, 10);
-  if (isNaN(n) || n < 0)
+  const n = Number(val);
+  if (!/^\d+$/.test(val) || !Number.isSafeInteger(n))
     throw new Error(`${key} must be a non-negative integer, got: ${val}`);
   return n;
+}
+
+function envPort(key: string, fallback: number): number {
+  return Port.orThrow(envInt(key, fallback));
 }
 
 function envBool(key: string, fallback: boolean): boolean {
@@ -43,8 +48,8 @@ function envStr(key: string, fallback: string): string {
 
 export function loadConfig(): RelayConfig {
   const config: RelayConfig = {
-    relayPort: envInt("RELAY_PORT", 4000),
-    adminPort: envInt("ADMIN_PORT", 4001),
+    relayPort: envPort("RELAY_PORT", 4000),
+    adminPort: envPort("ADMIN_PORT", 4001),
     // Self-service endpoints (HMAC-authed, owner-scoped). Default-on
     // since they're harmless without an existing client + writeKey, but
     // operators can hard-disable with SELF_ENABLED=0 if they prefer to
@@ -56,7 +61,7 @@ export function loadConfig(): RelayConfig {
     // and accept the surface area. The HMAC + rate limit cap the worst
     // case but a localhost-only default removes the foot-gun for
     // someone who copy-pastes the compose file without reading the README.
-    selfPort: envInt("SELF_PORT", 4003),
+    selfPort: envPort("SELF_PORT", 4003),
     selfBind: envStr("SELF_BIND", "127.0.0.1"),
     selfEnabled: envBool("SELF_ENABLED", true),
     // Private verification oracle for the optional context gateway. It
@@ -64,7 +69,7 @@ export function loadConfig(): RelayConfig {
     // database (and therefore can never read every owner's write key).
     // Disabled by default; the compose deployment enables it on a shared
     // Unix socket protected by a separate bearer token.
-    contextVerifierPort: envInt("CONTEXT_VERIFIER_PORT", 4004),
+    contextVerifierPort: envPort("CONTEXT_VERIFIER_PORT", 4004),
     contextVerifierBind: envStr("CONTEXT_VERIFIER_BIND", "127.0.0.1"),
     contextVerifierSocket: process.env.CONTEXT_VERIFIER_SOCKET || null,
     contextVerifierEnabled: envBool("CONTEXT_VERIFIER_ENABLED", false),
