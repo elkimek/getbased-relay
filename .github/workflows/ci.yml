@@ -39,7 +39,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build image
-        # Just verifies the Dockerfile still produces a valid image.
-        # Doesn't push anywhere — production deploy is operator-managed.
+      - name: Build relay image
         run: docker build -t getbased-relay:ci .
+
+      - name: Test the relay production image
+        run: |
+          docker run --rm --entrypoint sh \
+            --mount "type=bind,src=$PWD/test,dst=/app/test,readonly" \
+            --mount "type=bind,src=$PWD/context-gateway,dst=/app/context-gateway,readonly" \
+            getbased-relay:ci -c 'node --test test/*.test.mjs'
+
+      - name: Build gateway image
+        run: docker build -t getbased-context-gateway:ci context-gateway
+
+      - name: Check gateway startup and verified context lifecycle
+        run: |
+          docker run -d --name context-gateway-ci \
+            -e CONTEXT_VERIFIER_SOCKET=/run/getbased-verifier/ci.sock \
+            -e CONTEXT_VERIFIER_TOKEN=synthetic-ci-verifier-token \
+            --mount "type=bind,src=$PWD/scripts/check-gateway-image.mjs,dst=/tmp/check-gateway-image.mjs,readonly" \
+            getbased-context-gateway:ci
+          trap 'docker logs context-gateway-ci; docker rm -f context-gateway-ci' EXIT
+          docker exec context-gateway-ci node /tmp/check-gateway-image.mjs
