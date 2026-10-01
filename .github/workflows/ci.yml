@@ -39,7 +39,35 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build image
-        # Just verifies the Dockerfile still produces a valid image.
-        # Doesn't push anywhere — production deploy is operator-managed.
+      - name: Build relay image
         run: docker build -t getbased-relay:ci .
+
+      - name: Test the relay production image
+        run: |
+          docker run --rm --entrypoint sh \
+            --mount "type=bind,src=$PWD/test,dst=/app/test,readonly" \
+            --mount "type=bind,src=$PWD/context-gateway,dst=/app/context-gateway,readonly" \
+            getbased-relay:ci -c 'node --test test/*.test.mjs'
+
+      - name: Build gateway image
+        run: docker build -t getbased-context-gateway:ci context-gateway
+
+      - name: Check gateway startup and request validation
+        run: |
+          docker run -d --name context-gateway-ci getbased-context-gateway:ci
+          trap 'docker rm -f context-gateway-ci' EXIT
+          docker exec context-gateway-ci node --input-type=module -e '
+            import assert from "node:assert/strict";
+            let response;
+            for (let attempt = 0; attempt < 50; attempt++) {
+              try { response = await fetch("http://127.0.0.1:4001/health"); break; }
+              catch { await new Promise(resolve => setTimeout(resolve, 100)); }
+            }
+            assert.equal(response?.status, 200);
+            const invalid = await fetch("http://127.0.0.1:4001/api/context", {
+              method: "POST",
+              headers: { Authorization: "Bearer synthetic-ci-token", "Content-Type": "application/json" },
+              body: "null",
+            });
+            assert.equal(invalid.status, 400);
+          '

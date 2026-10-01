@@ -27,8 +27,17 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Runtime majors require a separate LTS and compatibility review.
+      - dependency-name: node
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: docker
     directory: /context-gateway
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: node
+        update-types:
+          - "version-update:semver-major"

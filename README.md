@@ -56,6 +56,8 @@ docker compose up -d --build
 
 Requires Node.js >= 24.20.0. TypeScript is installed as a development dependency.
 
+Both Docker images pin Node.js 24.21.0 LTS by tag and digest. Dependabot keeps updates within the current Node major; a future runtime major requires a separate LTS and compatibility review. CI runs the regression suite inside the built relay image and checks the built gateway image's startup and request validation.
+
 ```bash
 npm ci
 npm run build
