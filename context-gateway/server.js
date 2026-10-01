@@ -94,7 +94,7 @@ function decodeOwnerId(ownerId) {
   if (typeof ownerId !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(ownerId)) return null;
   try {
     const buf = Buffer.from(ownerId, 'base64url');
-    return buf.length === 16 ? buf : null;
+    return buf.length === 16 && buf.toString('base64url') === ownerId ? buf : null;
   } catch {
     return null;
   }
@@ -236,11 +236,19 @@ function readBody(req, maxBytes) {
   });
 }
 
+async function readJsonObject(req, maxBytes, allowEmpty = false) {
+  const body = await readBody(req, maxBytes);
+  const data = allowEmpty && !body ? {} : JSON.parse(body);
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('invalid_json');
+  }
+  return data;
+}
+
 async function handlePostContext(req, res, token, tokenHash) {
   let data;
   try {
-    const body = await readBody(req, Math.max(MAX_CONTEXT_BYTES + 4096, 32 * 1024));
-    data = JSON.parse(body);
+    data = await readJsonObject(req, Math.max(MAX_CONTEXT_BYTES + 4096, 32 * 1024));
   } catch (e) {
     const msg = e?.message === 'payload_too_large' ? 'Payload too large' : 'Invalid JSON';
     json(res, e?.message === 'payload_too_large' ? 413 : 400, { error: msg });
@@ -353,10 +361,9 @@ function handleGetContext(req, res, token, tokenHash, url) {
 }
 
 async function handleDeleteContext(req, res, tokenHash) {
-  let data = {};
+  let data;
   try {
-    const body = await readBody(req, 4096);
-    data = body ? JSON.parse(body) : {};
+    data = await readJsonObject(req, 4096, true);
   } catch {
     json(res, 400, { error: 'Invalid JSON' });
     return;
@@ -420,7 +427,10 @@ const server = createServer((req, res) => {
   const tokenHash = sha256Hex(token);
 
   if (req.method === 'POST' && url.pathname === '/api/context') {
-    void handlePostContext(req, res, token, tokenHash);
+    void handlePostContext(req, res, token, tokenHash).catch(error => {
+      console.error('Context upload failed:', error);
+      if (!res.headersSent && !res.destroyed) json(res, 500, { error: 'request_failed' });
+    });
     return;
   }
 
@@ -430,7 +440,10 @@ const server = createServer((req, res) => {
   }
 
   if (req.method === 'DELETE' && url.pathname === '/api/context') {
-    void handleDeleteContext(req, res, tokenHash);
+    void handleDeleteContext(req, res, tokenHash).catch(error => {
+      console.error('Context revocation failed:', error);
+      if (!res.headersSent && !res.destroyed) json(res, 500, { error: 'request_failed' });
+    });
     return;
   }
 

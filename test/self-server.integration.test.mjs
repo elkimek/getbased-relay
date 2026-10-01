@@ -217,6 +217,19 @@ test("storage probe still works after compact (returns 0)", async () => {
   assert.equal(body.lastWriteToken, null, "lastWriteToken should be null when no writes have landed");
 });
 
+test("compact rejects non-object JSON and continues serving signed storage", async () => {
+  for (const body of ["null", "[]", "true", "42", '"text"']) {
+    const response = await fetch(`http://127.0.0.1:${port}/self/compact-owner`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-Forwarded-For": "192.0.2.99" }, body,
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "invalid_json" });
+  }
+  const ts = Date.now();
+  const response = await fetch(`http://127.0.0.1:${port}/self/owner-storage?ownerId=${ownerIdStr}&timestamp=${ts}&signature=${sign("storage", ownerIdStr, ts)}`);
+  assert.equal(response.status, 200);
+});
+
 test("rate limit fires at request 11 on compact (matches per-IP cap)", async () => {
   // Burn the bucket — same setup, fresh signatures so we don't test
   // dedup. Each request gets a unique ts.

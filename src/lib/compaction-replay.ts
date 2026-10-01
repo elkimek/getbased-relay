@@ -7,7 +7,7 @@
 // acknowledges exact replays without re-inserting their encrypted payloads.
 
 import Database from "better-sqlite3";
-import { isNonEmptyArray, ok } from "@evolu/common";
+import { isNonEmptyArray, ok, type OwnerId } from "@evolu/common";
 import {
   ownerIdBytesToOwnerId,
   timestampToTimestampBytes,
@@ -59,6 +59,10 @@ export function countCompactedTimestamps(
 
 export interface CompactionReplayGuard extends Disposable {
   readonly storage: Storage;
+  /** Broadcast only accepted writes while compaction still holds off. */
+  readonly withBroadcast: (
+    broadcast: (ownerId: OwnerId, messages: readonly EncryptedCrdtMessage[]) => void,
+  ) => Storage;
 }
 
 export function createCompactionReplayGuard(
@@ -79,43 +83,53 @@ export function createCompactionReplayGuard(
     WHERE "ownerId" = ?
   `);
 
-  const guardedStorage: Storage = {
-    ...storage,
-    writeMessages: (ownerIdBytes, messages) => async (run) => {
-      const ownerId = ownerIdBytesToOwnerId(ownerIdBytes);
-      return withOwnerWriteLock(ownerId, async () => {
-        const accepted: EncryptedCrdtMessage[] = [];
-        let rejectedBytes = 0;
-        for (const message of messages) {
-          const timestamp = timestampToTimestampBytes(message.timestamp);
-          if (wasCompacted.get(Buffer.from(ownerIdBytes), Buffer.from(timestamp))) {
-            rejectedBytes += message.change.length;
-          } else {
-            accepted.push(message);
+  function createGuardedStorage(
+    broadcast?: (ownerId: OwnerId, messages: readonly EncryptedCrdtMessage[]) => void,
+  ): Storage {
+    return {
+      ...storage,
+      writeMessages: (ownerIdBytes, messages) => async (run) => {
+        const ownerId = ownerIdBytesToOwnerId(ownerIdBytes);
+        return withOwnerWriteLock(ownerId, async () => {
+          const accepted: EncryptedCrdtMessage[] = [];
+          let rejectedBytes = 0;
+          for (const message of messages) {
+            const timestamp = timestampToTimestampBytes(message.timestamp);
+            if (wasCompacted.get(Buffer.from(ownerIdBytes), Buffer.from(timestamp))) {
+              rejectedBytes += message.change.length;
+            } else {
+              accepted.push(message);
+            }
           }
-        }
 
-        const rejectedMessages = messages.length - accepted.length;
-        if (rejectedMessages > 0) {
-          logger.emit("info", "compaction.replay_filtered", {
-            ownerId,
-            rejectedMessages,
-            rejectedBytes,
-            acceptedMessages: accepted.length,
-          });
-        }
-        if (!isNonEmptyArray(accepted)) return ok();
-        return await run(storage.writeMessages(ownerIdBytes, accepted));
-      });
-    },
-    deleteOwner: (ownerIdBytes: OwnerIdBytes) => {
-      storage.deleteOwner(ownerIdBytes);
-      deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
-    },
-  };
+          const rejectedMessages = messages.length - accepted.length;
+          if (rejectedMessages > 0) {
+            logger.emit("info", "compaction.replay_filtered", {
+              ownerId,
+              rejectedMessages,
+              rejectedBytes,
+              acceptedMessages: accepted.length,
+            });
+          }
+          if (!isNonEmptyArray(accepted)) return ok();
+          const result = await run(storage.writeMessages(ownerIdBytes, accepted));
+          // The protocol normally broadcasts its original, unfiltered batch.
+          // Send the accepted batch here, after persistence and before releasing
+          // the same-owner lock, so compaction cannot slip between the two.
+          if (result.ok) broadcast?.(ownerId, accepted);
+          return result;
+        });
+      },
+      deleteOwner: (ownerIdBytes: OwnerIdBytes) => {
+        storage.deleteOwner(ownerIdBytes);
+        deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
+      },
+    };
+  }
 
   return {
-    storage: guardedStorage,
+    storage: createGuardedStorage(),
+    withBroadcast: createGuardedStorage,
     [Symbol.dispose]() {
       db.close();
     },

@@ -12,26 +12,11 @@ export function createQuotaChecker(
   logger: Logger,
   metrics: Metrics,
 ): (ownerId: string, requiredBytes: number) => boolean {
-  let globalUsageCache = 0;
-  let lastGlobalCheck = 0;
-  const CACHE_TTL_MS = 60_000;
-
-  function refreshGlobalUsage(): void {
-    const now = Date.now();
-    if (now - lastGlobalCheck < CACHE_TTL_MS) return;
-    lastGlobalCheck = now;
-    try {
-      globalUsageCache = metrics.getTotalStoredBytes();
-    } catch {
-      globalUsageCache = 0;
-    }
-  }
-
   return function isOwnerWithinQuota(
     ownerId: string,
     requiredBytes: number,
   ): boolean {
-    if (requiredBytes >= config.quotaPerOwnerBytes) {
+    if (requiredBytes > config.quotaPerOwnerBytes) {
       logger.emit("warn", "quota.owner_exceeded", {
         ownerId,
         requiredBytes,
@@ -40,12 +25,23 @@ export function createQuotaChecker(
       return false;
     }
 
-    refreshGlobalUsage();
-    if (globalUsageCache > config.quotaGlobalBytes) {
+    let usage;
+    try {
+      usage = metrics.getQuotaUsage(ownerId);
+    } catch (error) {
+      logger.emit("error", "quota.usage_unavailable", { error: String(error) });
+      return false;
+    }
+    // This synchronous callback runs immediately before Evolu's synchronous
+    // SQLite write transaction. No cached reads or awaits can admit another
+    // owner's write between the check and commit in this relay process.
+    const projectedUsage = usage.totalStoredBytes - usage.ownerStoredBytes + requiredBytes;
+    if (projectedUsage > config.quotaGlobalBytes) {
       logger.emit("warn", "quota.global_exceeded", {
         ownerId,
         requiredBytes,
-        globalUsage: globalUsageCache,
+        globalUsage: usage.totalStoredBytes,
+        projectedUsage,
         globalLimit: config.quotaGlobalBytes,
       });
       return false;

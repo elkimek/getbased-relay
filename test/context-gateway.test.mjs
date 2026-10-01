@@ -2,11 +2,12 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac, createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 let server, verifierServer, requestIp, port, ownerId, writeKey, token, tokenHash, dataDir;
+let verifierRequests = 0;
 
 function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
@@ -31,6 +32,7 @@ before(async () => {
   port = 15000 + Math.floor(Math.random() * 1000);
   const verifierSocket = join(dataDir, 'verifier.sock');
   verifierServer = createServer((req, res) => {
+    verifierRequests += 1;
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
@@ -162,6 +164,42 @@ test('owner token and profile limits are enforced', async () => {
   assert.equal(post3.status, 409);
   const body3 = await post3.json();
   assert.equal(body3.error, 'profile_limit_exceeded');
+});
+
+test('context routes reject non-object JSON and continue serving health', async () => {
+  const beforeRequests = verifierRequests;
+  for (const method of ['POST', 'DELETE']) {
+    for (const body of ['null', '[]', 'true', '42', '"text"']) {
+      const response = await fetch(`http://127.0.0.1:${port}/api/context`, {
+        method, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body,
+      });
+      assert.equal(response.status, 400);
+    }
+  }
+  assert.equal(verifierRequests, beforeRequests);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+});
+
+test('JSON object fields cannot bypass owner proof for upload or revocation', async () => {
+  const mapPath = join(dataDir, 'agent-token-map.json');
+  const ownerFile = join(dataDir, 'owners', `${ownerId}.json`);
+  const beforeMap = readFileSync(mapPath, 'utf8');
+  const beforeOwner = readFileSync(ownerFile, 'utf8');
+  const beforeRequests = verifierRequests;
+  for (const method of ['POST', 'DELETE']) {
+    const response = await fetch(`http://127.0.0.1:${port}/api/context`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ownerId, timestamp: Date.now(), profileId: 'p1', context: 'unauthorized',
+        signature: '0'.repeat(64), ok: true, verified: true, isAdmin: true,
+      }),
+    });
+    assert.equal(response.status, 401);
+  }
+  assert.equal(verifierRequests, beforeRequests + 2);
+  assert.equal(readFileSync(mapPath, 'utf8'), beforeMap);
+  assert.equal(readFileSync(ownerFile, 'utf8'), beforeOwner);
 });
 
 test('health endpoint works without token for docker healthchecks', async () => {

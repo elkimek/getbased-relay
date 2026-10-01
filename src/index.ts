@@ -2,9 +2,9 @@
 // Wraps @evolu/nodejs with structured logging, metrics, and quota management
 
 import { mkdirSync } from "fs";
-import { createRun, Name } from "@evolu/common";
+import { Name, Port, waitForAbort } from "@evolu/common";
 import { installPolyfills } from "@evolu/common/polyfills";
-import { createRelayDeps } from "@evolu/nodejs";
+import { createRelayDeps, runMain } from "@evolu/nodejs";
 import { loadConfig } from "./lib/config.js";
 import { createLogger } from "./lib/logger.js";
 import { createQuotaChecker } from "./lib/quota.js";
@@ -49,85 +49,48 @@ if (!check.ok) {
   process.exit(1);
 }
 
-// ─── Metrics (read-only DB access) ────────────────────
-const metrics = createMetrics(config, logger);
+// runMain owns the root Run, signal handling, and fatal defect exit status.
+// Returning from waitForAbort disposes every HTTP surface and relay resource.
+await runMain({ ...createRelayDeps(), console: logger.console, logger })(async (run) => {
+  await using disposer = new AsyncDisposableStack();
+  disposer.defer(() => logger.emit("info", "relay.stopped"));
+  const metrics = createMetrics(config, logger);
+  disposer.defer(() => metrics.close());
+  const ownerTracker = createOwnerTracker(config, logger);
+  disposer.defer(() => ownerTracker.stop());
+  logger.setOwnerCallback((ownerId) => ownerTracker.trackOwner(ownerId));
 
-// ─── Owner tracker ────────────────────────────────────
-const ownerTracker = createOwnerTracker(config, logger);
-
-// ─── Quota checker ────────────────────────────────────
-const isOwnerWithinQuota = createQuotaChecker(config, logger, metrics);
-
-// Wire owner tracking through logger subscribe events
-logger.setOwnerCallback((ownerId: string) =>
-  ownerTracker.trackOwner(ownerId),
-);
-
-// ─── Evolu relay ──────────────────────────────────────
-const relayRun = createRun({
-  ...createRelayDeps(),
-  console: logger.console,
-  logger,
-});
-const relay = await relayRun.abortable(createReplayProtectedRelay({
-  port: config.relayPort,
-  name: Name.orThrow(config.relayName),
-  enableLogging: config.enableEvoluLogging,
-  isOwnerWithinQuota,
-}));
-
-if (!relay.ok) {
-  logger.emit("error", "relay.failed", { error: relay.error as unknown as Record<string, unknown> });
-  await relayRun[Symbol.asyncDispose]();
-  process.exit(1);
-}
-
-// ─── Admin server ─────────────────────────────────────
-const admin = createAdminServer(config, logger, metrics, ownerTracker);
-await admin.start();
-
-// ─── Self-service server (HMAC-authed, owner-scoped) ──
-const self = config.selfEnabled ? createSelfServer(config, logger) : null;
-if (self) await self.start();
-
-// ─── Private Agent Access signature verifier ──────────
-const contextVerifier = config.contextVerifierEnabled
-  ? createContextVerifierServer(config, logger)
-  : null;
-if (contextVerifier) await contextVerifier.start();
-
-logger.emit("info", "relay.ready", {
-  relay: `ws://0.0.0.0:${config.relayPort}`,
-  admin: `http://127.0.0.1:${config.adminPort}`,
-  self: self ? `http://${config.selfBind}:${config.selfPort}` : null,
-  contextVerifier: contextVerifier
-    ? config.contextVerifierSocket ?? `http://${config.contextVerifierBind}:${config.contextVerifierPort}`
-    : null,
-});
-
-// ─── Graceful shutdown ────────────────────────────────
-let isShuttingDown = false;
-
-async function shutdown(signal: string): Promise<void> {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-  logger.emit("info", "relay.shutting_down", { signal });
-
-  ownerTracker.stop();
-  metrics.close();
-  try {
-    if ("value" in relay) await relay.value[Symbol.asyncDispose]();
-    await relayRun[Symbol.asyncDispose]();
-  } catch (e) {
-    logger.emit("warn", "relay.dispose_error", { error: (e as Error).message });
+  const relay = disposer.use(await run.ok(createReplayProtectedRelay({
+    port: Port.orThrow(config.relayPort),
+    name: Name.orThrow(config.relayName),
+    enableLogging: config.enableEvoluLogging,
+    isOwnerWithinQuota: createQuotaChecker(config, logger, metrics),
+  })));
+  const admin = disposer.adopt(
+    createAdminServer(config, logger, metrics, ownerTracker,
+      () => !run.signal.aborted && metrics.isReady()),
+    (server) => server.stop(),
+  );
+  await admin.start();
+  if (config.selfEnabled) {
+    const self = disposer.adopt(createSelfServer(config, logger), (server) => server.stop());
+    await self.start();
   }
-  await admin.stop();
-  if (self) await self.stop();
-  if (contextVerifier) await contextVerifier.stop();
+  if (config.contextVerifierEnabled) {
+    const verifier = disposer.adopt(createContextVerifierServer(config, logger), (server) => server.stop());
+    await verifier.start();
+  }
 
-  logger.emit("info", "relay.stopped");
-  process.exit(0);
-}
-
-process.once("SIGINT", () => shutdown("SIGINT"));
-process.once("SIGTERM", () => shutdown("SIGTERM"));
+  logger.emit("info", "relay.ready", {
+    relay: `ws://0.0.0.0:${relay.port}`,
+    admin: `http://127.0.0.1:${config.adminPort}`,
+    self: config.selfEnabled ? `http://${config.selfBind}:${config.selfPort}` : null,
+    contextVerifier: config.contextVerifierEnabled
+      ? config.contextVerifierSocket ?? `http://${config.contextVerifierBind}:${config.contextVerifierPort}`
+      : null,
+  });
+  run.signal.addEventListener("abort", () => {
+    logger.emit("info", "relay.shutting_down", { reason: run.signal.reason });
+  }, { once: true });
+  return await run(waitForAbort);
+});

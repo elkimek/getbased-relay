@@ -31,11 +31,11 @@ function safeEqualHex(aHex: string, b: Buffer): boolean {
 }
 
 function checkBearer(req: IncomingMessage, token: string): boolean {
-  const provided = req.headers.authorization ?? "";
-  const expected = `Bearer ${token}`;
+  const provided = Buffer.from(req.headers.authorization ?? "");
+  const expected = Buffer.from(`Bearer ${token}`);
   return (
     provided.length === expected.length &&
-    timingSafeEqual(Buffer.from(provided), Buffer.from(expected))
+    timingSafeEqual(provided, expected)
   );
 }
 
@@ -63,7 +63,11 @@ function readJsonBody(req: IncomingMessage): Promise<VerificationBody> {
     });
     req.on("end", () => {
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        const body: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        if (body === null || typeof body !== "object" || Array.isArray(body)) {
+          throw new Error("invalid_json");
+        }
+        resolve(body as VerificationBody);
       } catch {
         reject(new Error("invalid_json"));
       }
@@ -78,7 +82,8 @@ function decodeOwnerId(ownerId: unknown): Buffer | null {
   }
   try {
     const decoded = Buffer.from(ownerId, "base64url");
-    return decoded.length === 16 ? decoded : null;
+    return decoded.length === 16 && decoded.toString("base64url") === ownerId
+      ? decoded : null;
   } catch {
     return null;
   }
@@ -168,7 +173,10 @@ export function createContextVerifierServer(
     // general HTTP router. Dispatch every authenticated request to the same
     // read-only verifier; malformed or body-less requests fail JSON/proof
     // validation without reaching a second operation.
-    void handleVerify(req, res);
+    void handleVerify(req, res).catch((error: unknown) => {
+      logger.emit("error", "context_verifier.request_failed", { error: String(error) });
+      if (!res.headersSent && !res.destroyed) json(res, 503, { ok: false });
+    });
   });
 
   server.headersTimeout = 5000;

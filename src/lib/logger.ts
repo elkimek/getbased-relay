@@ -7,7 +7,7 @@
 //
 // We parse these into structured JSON events at appropriate log levels.
 
-import { createConsole, type Console } from "@evolu/common";
+import { createConsole, type Console, type ConsoleEntry } from "@evolu/common";
 import type { RelayConfig } from "./config.js";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
@@ -61,27 +61,40 @@ export function createLogger(config: RelayConfig): Logger {
     if (!shouldLog(level)) return;
 
     const stream = level === "error" ? process.stderr : process.stdout;
+    const seen = new WeakSet<object>();
+    const serialize = (value: unknown): string => JSON.stringify(value, (_key, item: unknown) => {
+      if (typeof item === "bigint") return item.toString();
+      if (item instanceof Error) return { name: item.name, message: item.message, stack: item.stack };
+      if (item !== null && typeof item === "object") {
+        if (seen.has(item)) return "[Circular]";
+        seen.add(item);
+      }
+      return item;
+    });
 
     if (isJson) {
       stream.write(
-        JSON.stringify({ ts: new Date().toISOString(), level, event, ...data }) +
+        serialize({ ts: new Date().toISOString(), level, event, ...data }) +
           "\n",
       );
     } else {
       const prefix = `[${new Date().toISOString()}] [${level.toUpperCase()}]`;
       const detail =
         data && Object.keys(data).length > 0
-          ? " " + JSON.stringify(data)
+          ? " " + serialize(data)
           : "";
       stream.write(`${prefix} ${event}${detail}\n`);
     }
   }
 
-  function parseRelayLog(_method: string, args: unknown[]): void {
+  function parseRelayLog(entry: ConsoleEntry): void {
+    const args = [...entry.args];
+    const methodLevel: LogLevel = entry.method === "error" ? "error"
+      : entry.method === "warn" ? "warn" : entry.method === "info" ? "info" : "debug";
     if (args[0] === "[relay]") {
       const tag = args[1] as string;
       const data = (args[2] as Record<string, unknown>) ?? {};
-      const level: LogLevel = TAG_LEVELS[tag] || "debug";
+      const level: LogLevel = TAG_LEVELS[tag] || methodLevel;
 
       if (
         tag === "connection" &&
@@ -108,7 +121,14 @@ export function createLogger(config: RelayConfig): Logger {
     } else if (msg.includes("disposed")) {
       emit("info", "relay.disposed", { message: msg });
     } else {
-      emit("debug", "relay.internal", { args: args.map(String) });
+      // Do not turn upstream errors into debug-only entries. Preserve native
+      // Console scopes, and keep raw diagnostic output behind the existing flag.
+      if (methodLevel === "debug" && !config.enableEvoluLogging) return;
+      emit(methodLevel, "relay.internal", {
+        scope: entry.path,
+        args: args.map((arg) => arg instanceof Error
+          ? { name: arg.name, message: arg.message, stack: arg.stack } : arg),
+      });
     }
   }
 
@@ -118,7 +138,7 @@ export function createLogger(config: RelayConfig): Logger {
   const consoleImpl = createConsole({
     level: "trace",
     output: {
-      write: (entry) => parseRelayLog(entry.method, [...entry.args]),
+      write: parseRelayLog,
     },
   });
 
