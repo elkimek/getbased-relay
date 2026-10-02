@@ -4,6 +4,8 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 ## Unreleased
 
+## [2.0.1] - 2026-10-02
+
 ### Security
 
 - Reject non-object JSON on self-service, verifier, and Agent Access routes and handle asynchronous request failures without crashing the service.
@@ -20,6 +22,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 ### Changed
 
+- Bundle Context Gateway 1.3.1 with the Agent Access request-validation and owner-ID fixes.
 - Pin both Docker images to Node.js 24.21.0 LTS and keep automated Docker updates within that major.
 - Update Node.js development types to 24.13.4 and the CodeQL action to 4.38.2.
 - Run the regression suite in the production relay image and verify the gateway image's context upload, persistence, read, and revocation in CI.
@@ -100,6 +103,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 - Hardened Context Gateway input validation and closed a prototype-pollution finding.
 
+[2.0.1]: https://github.com/elkimek/getbased-relay/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/elkimek/getbased-relay/compare/v1.2.3...v2.0.0
 [1.2.3]: https://github.com/elkimek/getbased-relay/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/elkimek/getbased-relay/compare/v1.2.1...v1.2.2
