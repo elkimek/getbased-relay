@@ -12,7 +12,7 @@ Evolu is an npm dependency here, not vendored source. The current checkout targe
 
 | Relay | `@evolu/common` | `@evolu/nodejs` | Node.js |
 |---|---:|---:|---:|
-| Unreleased | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
+| v2.0.1 | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
 | v2.0.0 | `^8.9.0` (locked to 8.9.0) | `^3.2.0` (locked to 3.2.0) | >= 24.20.0 |
 | v1.2.3 | `^7.4.0` | `^2.4.0` | >= 22.0.0 |
 
@@ -238,7 +238,7 @@ docker compose up -d
 
 ## Releases
 
-For the unreleased upstream upgrade, back up the relay volume before rebuilding. Preserve the current environment variables and proxy routes; no database migration, owner-key rotation, or browser package update is needed. Global quota admission now checks the projected payload total on every write and rejects writes when usage cannot be read. Run one relay process per database; the in-process compaction locks and admission checks do not coordinate multiple relay processes.
+For the v2.0.1 upgrade, back up the relay volume before rebuilding. Preserve the current environment variables and proxy routes; no database migration, owner-key rotation, or browser package update is needed. Global quota admission now checks the projected payload total on every write and rejects writes when usage cannot be read. Run one relay process per database; the in-process compaction locks and admission checks do not coordinate multiple relay processes.
 
 `npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
 
