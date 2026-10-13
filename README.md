@@ -8,11 +8,11 @@ Built for [getbased](https://github.com/elkimek/get-based), a blood work dashboa
 
 ## Evolu compatibility
 
-Evolu is an npm dependency here, not vendored source. The current checkout locks `@evolu/common` 8.18.0 and `@evolu/nodejs` 4.2.0. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build. The main row below shows those exact locked versions; release rows describe the published releases.
+Evolu is an npm dependency here, not vendored source. The current checkout locks `@evolu/common` 8.18.0 and `@evolu/nodejs` 4.2.0. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build. The table below records the dependency versions for each release.
 
 | Relay | `@evolu/common` | `@evolu/nodejs` | Node.js |
 |---|---:|---:|---:|
-| main | 8.18.0 | 4.2.0 | >= 24.20.0 |
+| v2.0.2 | `^8.18.0` (locked to 8.18.0) | `^4.2.0` (locked to 4.2.0) | >= 24.20.0 |
 | v2.0.1 | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
 | v2.0.0 | `^8.9.0` (locked to 8.9.0) | `^3.2.0` (locked to 3.2.0) | >= 24.20.0 |
 | v1.2.3 | `^7.4.0` | `^2.4.0` | >= 22.0.0 |
