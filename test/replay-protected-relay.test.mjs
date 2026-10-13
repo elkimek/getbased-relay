@@ -92,7 +92,8 @@ const ownerBytes = Buffer.alloc(16, 1);
 const ownerId = ownerBytes.toString("base64url");
 const writeKey = Buffer.alloc(16, 2);
 const oldMessage = { timestamp: { millis: 1000, counter: 0, nodeId: "0011223344556677" }, change: Buffer.alloc(80, 3) };
-const freshMessage = { timestamp: { millis: 2000, counter: 0, nodeId: "0011223344556677" }, change: Buffer.alloc(17, 4) };
+// Requests must carry at least 41 bytes per encrypted change in Evolu 8.18.
+const freshMessage = { timestamp: { millis: 2000, counter: 0, nodeId: "0011223344556677" }, change: Buffer.alloc(64, 4) };
 function request(messages = [], subscribe = false) {
   const frame = createProtocolMessageBuffer(ownerId, {
     messageType: MessageType.Request, writeKey,
@@ -138,9 +139,9 @@ test("compaction filters replay-only and mixed broadcasts and still sends fresh 
       await send(writer, request([oldMessage, freshMessage]));
       const [frame] = await delivered;
       assert.equal(frame.includes(Buffer.alloc(80, 3)), false);
-      assert.equal(frame.includes(Buffer.alloc(17, 4)), true);
+      assert.equal(frame.includes(Buffer.alloc(64, 4)), true);
       assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 1);
-      assert.equal(db.prepare("SELECT storedBytes FROM evolu_usage").get().storedBytes, 17);
+      assert.equal(db.prepare("SELECT storedBytes FROM evolu_usage").get().storedBytes, 64);
       assert.equal(db.prepare("SELECT COUNT(*) AS n FROM getbased_compacted_timestamp").get().n, 1);
     } finally { db.close(); }
   });
