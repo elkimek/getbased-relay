@@ -4,6 +4,31 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 ## Unreleased
 
+## [2.0.2] - 2026-10-13
+
+### Security
+
+- Update Evolu's protocol validation to reject malformed sync requests before storing, subscribing, or broadcasting, including encrypted changes shorter than 41 bytes, invalid flags, and invalid or oversized ranges. This prevents malformed-message memory pressure and short-change quota bypasses.
+
+### Fixed
+
+- Incorporate Evolu's fixes for sync failures when protocol messages are nearly full and endless retries on stored changes too large for a message. Oversized changes remain stored but are skipped during reconciliation.
+- Roll back failed SQLite writes and return a protocol write error without broadcasting the failed changes. The service remains running and can resume writes after storage is repaired, instead of repeatedly crashing on the same write.
+- Update the WebSocket dependency with the fix that validates close arguments before changing the connection state.
+
+### Changed
+
+- Lock `@evolu/common` to 8.18.0 and `@evolu/nodejs` to 4.2.0; require common 8.18.0 or later within the same major.
+- Update `ws` to 8.22.0 and Node.js development types to 24.19.1.
+- Refresh both pinned Node.js 24.21.0 LTS Docker image digests.
+- Update regression fixtures to valid encrypted-change sizes and verify write rollback, no failed-write broadcasts, unhealthy readiness while a required table is missing, and successful writes and broadcasts after repair.
+
+### Upgrade notes
+
+- Back up the relay volume, then rebuild both services or run `npm ci` and `npm run build` for a native installation. Preserve the existing database volume, owner keys, environment settings, and HTTP/proxy routes. No database migration, owner-key rotation, or browser package update is required.
+- SQLite write failures now leave the service running and report a protocol write error. Investigate and repair the storage problem; `/health` returns 503 when required database tables are missing. Other fatal task defects retain shutdown and failure exit handling.
+- Stored changes too large for a protocol message are skipped to let sync finish; this update does not recover those changes automatically.
+
 ## [2.0.1] - 2026-10-02
 
 ### Security
@@ -103,6 +128,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 - Hardened Context Gateway input validation and closed a prototype-pollution finding.
 
+[2.0.2]: https://github.com/elkimek/getbased-relay/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/elkimek/getbased-relay/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/elkimek/getbased-relay/compare/v1.2.3...v2.0.0
 [1.2.3]: https://github.com/elkimek/getbased-relay/compare/v1.2.2...v1.2.3
