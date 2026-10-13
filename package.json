@@ -14,13 +14,13 @@
   },
   "dependencies": {
     "@evolu/common": "^8.18.0",
-    "@evolu/nodejs": "^4.1.0",
+    "@evolu/nodejs": "^4.2.0",
     "better-sqlite3": "^13.0.3",
-    "ws": "^8.21.3"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^24.13.4",
+    "@types/node": "^24.19.1",
     "@types/ws": "^8.18.1",
     "typescript": "^7.0.2"
   },

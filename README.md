@@ -8,10 +8,11 @@ Built for [getbased](https://github.com/elkimek/get-based), a blood work dashboa
 
 ## Evolu compatibility
 
-Evolu is an npm dependency here, not vendored source. The current checkout targets `@evolu/common` 8.14.0 and `@evolu/nodejs` 4.1.0, matching the core packages in upstream relay 4.1.3. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build.
+Evolu is an npm dependency here, not vendored source. The current checkout locks `@evolu/common` 8.18.0 and `@evolu/nodejs` 4.2.0. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build. The main row below shows those exact locked versions; release rows describe the published releases.
 
 | Relay | `@evolu/common` | `@evolu/nodejs` | Node.js |
 |---|---:|---:|---:|
+| main | 8.18.0 | 4.2.0 | >= 24.20.0 |
 | v2.0.1 | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
 | v2.0.0 | `^8.9.0` (locked to 8.9.0) | `^3.2.0` (locked to 3.2.0) | >= 24.20.0 |
 | v1.2.3 | `^7.4.0` | `^2.4.0` | >= 22.0.0 |
@@ -19,6 +20,8 @@ Evolu is an npm dependency here, not vendored source. The current checkout targe
 The package version streams are independent: Evolu 8 uses the 8.x `common` package; the current Node adapter is 4.x. This relay upgrade preserves the existing WebSocket protocol, owner keys, relay tables, self-service response fields, and Agent Access proof format. It does not require an application or browser Evolu upgrade.
 
 The mirrored WebSocket adapter retains GetBased's storage decorator and incorporates upstream's 30-second heartbeats, 16 MiB unsent broadcast limit, and shutdown guards. Explicit optional tooling overrides avoid the Node adapter's conflicting lint peer resolutions; SQLite install scripts are allowed for npm versions that require an allowlist.
+
+Evolu 8.18 rejects malformed requests, including encrypted changes shorter than 41 bytes, before applying them. SQLite write failures roll back the batch, return a protocol write error, and do not broadcast the failed changes. The service keeps running so writes can resume after the storage problem is repaired; `/health` returns 503 when required database tables are missing. Other fatal task defects remain subject to `runMain`'s shutdown and failure exit handling.
 
 ## Why
 
