@@ -18,7 +18,7 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 ### Added
 
 - Public `GET` and `HEAD /health` on the WebSocket port, reporting database-schema readability; other HTTP requests receive 426. The private admin health endpoint retains its stronger required-table and replay-readiness checks.
-- Regression coverage for request ordering, reply backpressure, heartbeat progress, public health, and opening a synthetic 2.0.2 database while preserving keys, stored messages and compaction tombstones. Migrate compaction tests to `createNodeJsSqliteDriver`.
+- Regression coverage for request ordering, reply backpressure, connection-close cancellation with a held reply, heartbeat progress, public health, and opening a synthetic 2.0.2 database while preserving keys, stored messages and compaction tombstones. Migrate compaction tests to `createNodeJsSqliteDriver`.
 
 ### Upgrade notes
 

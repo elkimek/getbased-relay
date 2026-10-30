@@ -331,3 +331,61 @@ test("the new core preserves a 2.0.2 database, owner keys, and compacted replays
     finally { db.close(); }
   });
 });
+
+test("closing a connection cancels a held reply and discards queued writes before shutdown", { timeout: 5000 }, async () => {
+  const written = Promise.withResolvers();
+  const countRuns = snapshot => 1 + snapshot.children.reduce((sum, child) => sum + countRuns(child), 0);
+  let serverSocket;
+  let release;
+  let hold = true;
+  const originalSend = WebSocket.prototype.send;
+  const sendMock = mock.method(WebSocket.prototype, "send", function (data, options, callback) {
+    if (this._isServer && hold && typeof callback === "function") {
+      serverSocket = this;
+      return originalSend.call(this, data, options, error => {
+        release = () => callback(error);
+        written.resolve();
+      });
+    }
+    return originalSend.call(this, data, options, callback);
+  });
+  try {
+    await withRelay(async ({ connect, relay, run }) => {
+      const idleRuns = countRuns(run.snapshot());
+      try {
+        const socket = await connect();
+        // Put both frames in one TCP write so the second is already queued by
+        // the parser while the first reply's completion callback is held.
+        socket._socket.cork();
+        socket.send(request([], true));
+        socket.send(request([freshMessage]));
+        socket._socket.uncork();
+        await written.promise;
+        assert.ok(countRuns(run.snapshot()) > idleRuns, "the reply task should still be pending");
+        const closed = once(socket, "close", { signal: AbortSignal.timeout(3000) });
+        serverSocket.terminate();
+        await closed;
+        for (let attempt = 0; attempt < 100 && countRuns(run.snapshot()) !== idleRuns; attempt++) {
+          await sleep(10);
+        }
+        assert.equal(countRuns(run.snapshot()), idleRuns,
+          "socket close must settle the pending task without releasing its reply callback or stopping the relay");
+        const db = new Database("evolu-relay.db", { readonly: true });
+        try {
+          assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 0,
+            "the queued write must not run after its connection closes");
+        } finally { db.close(); }
+        assert.equal(run.signal.aborted, false, "connection cancellation must not abort the relay");
+        hold = false;
+        await send(await connect(), request([{ ...freshMessage, timestamp: { ...freshMessage.timestamp, millis: 3000 } }]));
+        let timeout;
+        try {
+          await Promise.race([
+            relay[Symbol.asyncDispose](),
+            new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Relay shutdown stalled on the held reply")), 1000); }),
+          ]);
+        } finally { clearTimeout(timeout); }
+      } finally { hold = false; release?.(); }
+    });
+  } finally { hold = false; release?.(); sendMock.mock.restore(); }
+});

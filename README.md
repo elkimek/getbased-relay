@@ -246,7 +246,7 @@ docker compose up -d
 
 For the v2.0.1 upgrade, back up the relay volume before rebuilding. Preserve the current environment variables and proxy routes; no database migration, owner-key rotation, or browser package update is needed. Global quota admission now checks the projected payload total on every write and rejects writes when usage cannot be read. Run one relay process per database; the in-process compaction locks and admission checks do not coordinate multiple relay processes.
 
-`npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. The suite covers the existing Evolu 8.7 wire fixture, a synthetic database written by the 2.0.2 dependency stack, preserved keys and replay tombstones, pipelined request order, reply-write backpressure, and heartbeat progress. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
+`npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. The suite covers the existing Evolu 8.7 wire fixture, a synthetic database written by the 2.0.2 dependency stack, preserved keys and replay tombstones, pipelined request order, reply-write backpressure, connection-close cancellation during a held reply, and heartbeat progress. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
 
 See [CHANGELOG.md](CHANGELOG.md) for the versioned history and upgrade notes. GitHub release pages should be cut from the matching version commit; the package version, changelog entry, and tag must agree.
 
