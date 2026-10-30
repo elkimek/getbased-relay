@@ -13,8 +13,8 @@
     "test": "tsc && node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@evolu/common": "^8.18.0",
-    "@evolu/nodejs": "^4.2.0",
+    "@evolu/common": "8.24.1",
+    "@evolu/nodejs": "4.4.3",
     "better-sqlite3": "^13.0.3",
     "ws": "^8.22.0"
   },
@@ -27,9 +27,5 @@
   "license": "AGPL-3.0-or-later",
   "allowScripts": {
     "better-sqlite3": true
-  },
-  "overrides": {
-    "oxlint": "1.79.0",
-    "oxlint-tsgolint": "7.0.2001"
   }
 }
