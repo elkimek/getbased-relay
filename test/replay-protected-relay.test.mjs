@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import { createConsole, createRun, Port } from "@evolu/common";
 import { installPolyfills } from "@evolu/common/polyfills";
 import { createRelayDeps } from "@evolu/nodejs";
@@ -11,7 +11,7 @@ import { WebSocket } from "ws";
 import Database from "better-sqlite3";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  createProtocolMessageBuffer, MessageType, SubscriptionFlags,
+  createProtocolMessageBuffer, createTimestampsBuffer, InfiniteUpperBound, MessageType, RangeType, SubscriptionFlags,
 } from "@evolu/common/local-first";
 import { compactOwner } from "../dist/lib/compact-owner.js";
 
@@ -57,7 +57,7 @@ test("replay-protected relay starts, accepts WebSockets, and shuts down", async 
   }
 });
 
-async function withRelay(callback, options = {}) {
+async function withRelay(callback, options = {}, prepare = () => {}) {
   const dataDir = mkdtempSync(join(tmpdir(), "relay-regression-"));
   const previousCwd = process.cwd();
   const console = createConsole({ level: "silent" });
@@ -66,6 +66,7 @@ async function withRelay(callback, options = {}) {
   const sockets = [];
   let relay;
   try {
+    prepare(dataDir);
     process.chdir(dataDir);
     const result = await run.abortable(createReplayProtectedRelay({
       port: Port.orThrow(0), isOwnerWithinQuota: () => true, ...options,
@@ -94,9 +95,9 @@ const writeKey = Buffer.alloc(16, 2);
 const oldMessage = { timestamp: { millis: 1000, counter: 0, nodeId: "0011223344556677" }, change: Buffer.alloc(80, 3) };
 // Requests must carry at least 41 bytes per encrypted change in Evolu 8.18.
 const freshMessage = { timestamp: { millis: 2000, counter: 0, nodeId: "0011223344556677" }, change: Buffer.alloc(64, 4) };
-function request(messages = [], subscribe = false) {
-  const frame = createProtocolMessageBuffer(ownerId, {
-    messageType: MessageType.Request, writeKey,
+function request(messages = [], subscribe = false, owner = ownerId, key = writeKey) {
+  const frame = createProtocolMessageBuffer(owner, {
+    messageType: MessageType.Request, writeKey: key,
     subscriptionFlag: subscribe ? SubscriptionFlags.Subscribe : SubscriptionFlags.None,
   });
   for (const message of messages) frame.addMessage(message);
@@ -203,4 +204,188 @@ test("broadcast backlog disconnects a client that stops reading", async () => {
       assert.equal(writer.readyState, WebSocket.OPEN);
     } finally { subscriber._socket.resume(); }
   });
+});
+
+
+test("relay HTTP health reads storage and other HTTP requests require an upgrade", async () => {
+  await withRelay(async ({ relay, connect }) => {
+    const base = `http://127.0.0.1:${relay.port}`;
+    const health = await fetch(`${base}/health?probe=1`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { status: "ok" });
+    const head = await fetch(`${base}/health`, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), "");
+    for (const [path, method] of [["/", "GET"], ["/health", "POST"]]) {
+      const response = await fetch(base + path, { method });
+      assert.equal(response.status, 426);
+      assert.equal(response.headers.get("upgrade"), "websocket");
+    }
+    await send(await connect(), request([freshMessage]));
+  });
+});
+
+test("one connection keeps request order while other peers and heartbeats progress", { timeout: 5000 }, async () => {
+  const entered = Promise.withResolvers();
+  const gate = Promise.withResolvers();
+  let delayed = false;
+  const secondOwner = Buffer.alloc(16, 7).toString("base64url");
+  const thirdOwner = Buffer.alloc(16, 8).toString("base64url");
+  try {
+    await withRelay(async ({ connect }) => {
+      const pipeline = await connect();
+      const replies = [];
+      const completed = Promise.withResolvers();
+      pipeline.on("message", frame => {
+        replies.push(frame);
+        if (replies.length === 2) completed.resolve();
+      });
+      pipeline.send(request([oldMessage]));
+      pipeline.send(request([], true, secondOwner));
+      try {
+        await entered.promise;
+        // A blocked quota callback must hold this connection's later request,
+        // while another connection can still receive a reply.
+        await send(await connect(), request([], true, thirdOwner));
+        await sleep(60); // More than two heartbeat intervals with reads paused.
+        assert.equal(pipeline.readyState, WebSocket.OPEN);
+        assert.equal(replies.length, 0, "later requests must not overtake the blocked write");
+      } finally { gate.resolve(); }
+      await completed.promise;
+      assert.deepEqual(replies.map(frame => frame.subarray(1, 17)), [ownerBytes, Buffer.alloc(16, 7)]);
+    }, {
+      pingInterval: "10ms",
+      isOwnerWithinQuota: async () => {
+        if (!delayed) { delayed = true; entered.resolve(); await gate.promise; }
+        return true;
+      },
+    });
+  } finally { gate.resolve(); }
+});
+
+test("a connection waits for its reply write before serving another request", { timeout: 5000 }, async () => {
+  const written = Promise.withResolvers();
+  let release;
+  let hold = true;
+  const originalSend = WebSocket.prototype.send;
+  const sendMock = mock.method(WebSocket.prototype, "send", function (data, options, callback) {
+    if (this._isServer && hold) {
+      return originalSend.call(this, data, options, error => {
+        release = () => callback?.(error);
+        written.resolve();
+      });
+    }
+    return originalSend.call(this, data, options, callback);
+  });
+  try {
+    await withRelay(async ({ connect }) => {
+      const socket = await connect();
+      await send(socket, request([], true));
+      await written.promise;
+      socket.send(request([freshMessage]));
+      await sleep(40);
+      const db = new Database("evolu-relay.db", { readonly: true });
+      try {
+        assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 0,
+          "the next request must wait for the previous send callback");
+        const reply = once(socket, "message", { signal: AbortSignal.timeout(3000) });
+        hold = false; release();
+        await reply;
+        assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 1);
+      } finally { hold = false; release?.(); db.close(); }
+    });
+  } finally { hold = false; release?.(); sendMock.mock.restore(); }
+});
+
+
+test("the new core preserves a 2.0.2 database, owner keys, and compacted replays", async () => {
+  const compactedOwner = Buffer.alloc(16, 2);
+  const legacyKey = Buffer.alloc(16, 11);
+  const compactedKey = Buffer.alloc(16, 12);
+  await withRelay(async ({ connect }) => {
+    const socket = await connect();
+    // Exercise C timestamp iteration against rows and hashes written by 8.18.
+    const download = createProtocolMessageBuffer(ownerId, {
+      messageType: MessageType.Request, writeKey: legacyKey,
+    });
+    download.addRange({ type: RangeType.Timestamps, upperBound: InfiniteUpperBound, timestamps: createTimestampsBuffer() });
+    assert.equal((await send(socket, download.unwrap())).includes(Buffer.alloc(80, 21)), true);
+    await send(socket, request([{ ...freshMessage, change: Buffer.alloc(64, 24) }], false, ownerId, legacyKey));
+    await send(socket, request([{ ...oldMessage, change: Buffer.alloc(80, 22) }], false,
+      compactedOwner.toString("base64url"), compactedKey));
+    await send(socket, request([{ ...freshMessage, change: Buffer.alloc(64, 23) }], false,
+      compactedOwner.toString("base64url"), compactedKey));
+    const db = new Database("evolu-relay.db", { readonly: true });
+    try {
+      assert.deepEqual(db.prepare("SELECT writeKey FROM evolu_writeKey WHERE ownerId=?").get(ownerBytes).writeKey, legacyKey);
+      assert.deepEqual(db.prepare("SELECT writeKey FROM evolu_writeKey WHERE ownerId=?").get(compactedOwner).writeKey, compactedKey);
+      assert.equal(db.prepare("SELECT storedBytes FROM evolu_usage WHERE ownerId=?").get(ownerBytes).storedBytes, 144);
+      assert.equal(db.prepare("SELECT storedBytes FROM evolu_usage WHERE ownerId=?").get(compactedOwner).storedBytes, 64);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 3);
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM getbased_compacted_timestamp").get().n, 1);
+      assert.equal(db.pragma("integrity_check", { simple: true }), "ok");
+    } finally { db.close(); }
+  }, {}, dataDir => {
+    const db = new Database(join(dataDir, "evolu-relay.db"));
+    try { db.exec(readFileSync(new URL("./fixtures/relay-2.0.2.sql", import.meta.url), "utf8")); }
+    finally { db.close(); }
+  });
+});
+
+test("closing a connection cancels a held reply and discards queued writes before shutdown", { timeout: 5000 }, async () => {
+  const written = Promise.withResolvers();
+  const countRuns = snapshot => 1 + snapshot.children.reduce((sum, child) => sum + countRuns(child), 0);
+  let serverSocket;
+  let release;
+  let hold = true;
+  const originalSend = WebSocket.prototype.send;
+  const sendMock = mock.method(WebSocket.prototype, "send", function (data, options, callback) {
+    if (this._isServer && hold && typeof callback === "function") {
+      serverSocket = this;
+      return originalSend.call(this, data, options, error => {
+        release = () => callback(error);
+        written.resolve();
+      });
+    }
+    return originalSend.call(this, data, options, callback);
+  });
+  try {
+    await withRelay(async ({ connect, relay, run }) => {
+      const idleRuns = countRuns(run.snapshot());
+      try {
+        const socket = await connect();
+        // Put both frames in one TCP write so the second is already queued by
+        // the parser while the first reply's completion callback is held.
+        socket._socket.cork();
+        socket.send(request([], true));
+        socket.send(request([freshMessage]));
+        socket._socket.uncork();
+        await written.promise;
+        assert.ok(countRuns(run.snapshot()) > idleRuns, "the reply task should still be pending");
+        const closed = once(socket, "close", { signal: AbortSignal.timeout(3000) });
+        serverSocket.terminate();
+        await closed;
+        for (let attempt = 0; attempt < 100 && countRuns(run.snapshot()) !== idleRuns; attempt++) {
+          await sleep(10);
+        }
+        assert.equal(countRuns(run.snapshot()), idleRuns,
+          "socket close must settle the pending task without releasing its reply callback or stopping the relay");
+        const db = new Database("evolu-relay.db", { readonly: true });
+        try {
+          assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n, 0,
+            "the queued write must not run after its connection closes");
+        } finally { db.close(); }
+        assert.equal(run.signal.aborted, false, "connection cancellation must not abort the relay");
+        hold = false;
+        await send(await connect(), request([{ ...freshMessage, timestamp: { ...freshMessage.timestamp, millis: 3000 } }]));
+        let timeout;
+        try {
+          await Promise.race([
+            relay[Symbol.asyncDispose](),
+            new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Relay shutdown stalled on the held reply")), 1000); }),
+          ]);
+        } finally { clearTimeout(timeout); }
+      } finally { hold = false; release?.(); }
+    });
+  } finally { hold = false; release?.(); sendMock.mock.restore(); }
 });

@@ -8,10 +8,11 @@ Built for [getbased](https://github.com/elkimek/get-based), a blood work dashboa
 
 ## Evolu compatibility
 
-Evolu is an npm dependency here, not vendored source. The current checkout locks `@evolu/common` 8.18.0 and `@evolu/nodejs` 4.2.0. The ranges in `package.json` permit compatible updates within those majors; `package-lock.json` pins the exact versions used by `npm ci` and the Docker build. The table below records the dependency versions for each release.
+Evolu is an npm dependency here, not vendored source. The current checkout pins `@evolu/common` 8.24.1 and `@evolu/nodejs` 4.4.3 together. `package-lock.json` records the exact dependency tree used by `npm ci` and the Docker build. The table below records the dependency versions for each release.
 
 | Relay | `@evolu/common` | `@evolu/nodejs` | Node.js |
 |---|---:|---:|---:|
+| Unreleased | `8.24.1` | `4.4.3` | >= 24.20.0 |
 | v2.0.2 | `^8.18.0` (locked to 8.18.0) | `^4.2.0` (locked to 4.2.0) | >= 24.20.0 |
 | v2.0.1 | `^8.14.0` (locked to 8.14.0) | `^4.1.0` (locked to 4.1.0) | >= 24.20.0 |
 | v2.0.0 | `^8.9.0` (locked to 8.9.0) | `^3.2.0` (locked to 3.2.0) | >= 24.20.0 |
@@ -19,9 +20,11 @@ Evolu is an npm dependency here, not vendored source. The current checkout locks
 
 The package version streams are independent: Evolu 8 uses the 8.x `common` package; the current Node adapter is 4.x. This relay upgrade preserves the existing WebSocket protocol, owner keys, relay tables, self-service response fields, and Agent Access proof format. It does not require an application or browser Evolu upgrade.
 
-The mirrored WebSocket adapter retains GetBased's storage decorator and incorporates upstream's 30-second heartbeats, 16 MiB unsent broadcast limit, and shutdown guards. Explicit optional tooling overrides avoid the Node adapter's conflicting lint peer resolutions; SQLite install scripts are allowed for npm versions that require an allowlist.
+The mirrored WebSocket adapter retains getbased's storage decorator and incorporates upstream's per-connection request queue, yielding between requests, paused reads, and reply-write backpressure. Heartbeats skip connections while their requests are being served; the existing 16 MiB unsent broadcast limit, owner locks, accepted-only broadcasts, and shutdown guards remain in place. Malformed protocol requests are logged at debug level without raw frame bytes.
 
-Evolu 8.18 rejects malformed requests, including encrypted changes shorter than 41 bytes, before applying them. SQLite write failures roll back the batch, return a protocol write error, and do not broadcast the failed changes. The service keeps running so writes can resume after the storage problem is repaired; `/health` returns 503 when required database tables are missing. Other fatal task defects remain subject to `runMain`'s shutdown and failure exit handling.
+Evolu now uses its own SQLite 3.54.1 core and prebuilt native addon. Its relay database remains unencrypted because message payloads are already encrypted end to end; existing tables, owner keys and replay tombstones open in place. Our operational helpers still use the direct `better-sqlite3` dependency, so native build tooling and its install-script allowlist remain necessary. Do not upgrade `common` independently of the Node adapter: the new storage requires Evolu's SQLite functions. Optional tooling peer overrides are no longer needed.
+
+Evolu rejects malformed requests, including encrypted changes shorter than 41 bytes, before applying them. SQLite write failures roll back the batch, return a protocol write error, and do not broadcast the failed changes. The service keeps running so writes can resume after the storage problem is repaired; the private admin `/health` returns 503 when required database tables are missing. Other fatal task defects remain subject to `runMain`'s shutdown and failure exit handling.
 
 ## Why
 
@@ -57,7 +60,7 @@ docker compose up -d --build
 
 ### Node.js
 
-Requires Node.js >= 24.20.0. TypeScript is installed as a development dependency.
+Requires Node.js >= 24.20.0; use Node.js 24 LTS. TypeScript is installed as a development dependency. Evolu's native addon supports Linux (glibc >=2.28 or musl) and macOS >=13.5 on x64 and arm64. Native Windows relay execution is not supported by the new addon.
 
 Both Docker images pin Node.js 24.21.0 LTS by tag and digest. Dependabot keeps updates within the current Node major; a future runtime major requires a separate LTS and compatibility review. CI runs the regression suite inside the built relay image and checks the built gateway image's startup, verified context upload, persistence, read, and revocation.
 
@@ -95,7 +98,7 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 
 ## Endpoints
 
-**Relay port** (default 4000) — Evolu WebSocket sync. Connect your Evolu client with:
+**Relay port** (default 4000) — Evolu WebSocket sync and public HTTP health. `GET` and `HEAD /health` return 200 with `{"status":"ok"}` while the active relay can read its database schema, or 503 with `{"status":"error"}` on a failed read or shutdown. This is a storage-readability probe; the private admin `/health` below also checks required tables and replay-protection readiness. Other plain HTTP requests receive `426 Upgrade Required`. Connect your Evolu client with:
 
 ```javascript
 transports: [{ type: "WebSocket", url: "wss://your-relay.example.com" }]
@@ -163,7 +166,7 @@ AI assistants ─HTTPS─▶ :4001 Context Gateway ──Unix socket─▶ priva
 
 - **src/index.ts** — Entry point, wiring, signal handlers
 - **src/lib/config.ts** — Env var parsing with defaults and typed `RelayConfig` interface
-- **src/lib/logger.ts** — Custom Console that intercepts Evolu's 17 relay events, emits structured JSON at configurable levels
+- **src/lib/logger.ts** — Custom Console that intercepts Evolu's relay events, emits structured JSON at configurable levels
 - **src/lib/quota.ts** — Per-owner + global disk quota via `isOwnerWithinQuota` callback
 - **src/lib/compact-owner.ts** — Atomic owner compaction shared by admin and self-service routes
 - **src/lib/compaction-replay.ts** — Exact-timestamp tombstones that prevent stale devices from refilling compacted relay history
@@ -243,7 +246,7 @@ docker compose up -d
 
 For the v2.0.1 upgrade, back up the relay volume before rebuilding. Preserve the current environment variables and proxy routes; no database migration, owner-key rotation, or browser package update is needed. Global quota admission now checks the projected payload total on every write and rejects writes when usage cannot be read. Run one relay process per database; the in-process compaction locks and admission checks do not coordinate multiple relay processes.
 
-`npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
+`npm test` builds and runs storage, WebSocket, HTTP, quota, and process-lifecycle regression tests. The suite covers the existing Evolu 8.7 wire fixture, a synthetic database written by the 2.0.2 dependency stack, preserved keys and replay tombstones, pipelined request order, reply-write backpressure, connection-close cancellation during a held reply, and heartbeat progress. CI runs the same suite. The application can be validated separately against the upgraded relay before deployment; the upstream browser package update remains a separate change.
 
 See [CHANGELOG.md](CHANGELOG.md) for the versioned history and upgrade notes. GitHub release pages should be cut from the matching version commit; the package version, changelog entry, and tag must agree.
 

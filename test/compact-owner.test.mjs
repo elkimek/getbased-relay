@@ -22,7 +22,7 @@ import {
   createRelaySqliteStorage,
   createRelayStorageTables,
 } from "@evolu/common/local-first";
-import { createBetterSqliteDriver } from "@evolu/nodejs";
+import { createNodeJsSqliteDriver } from "@evolu/nodejs";
 
 import { compactOwner } from "../dist/lib/compact-owner.js";
 import { createCompactionReplayGuard } from "../dist/lib/compaction-replay.js";
@@ -72,7 +72,7 @@ function seedOwner(db, ownerIdBytes, { messageCount = 5, payloadBytes = 1000 } =
 async function openRealRelayStorage(dataDir, fresh) {
   const dbPath = join(dataDir, "compact-owner-relay-test.db");
   const createSqliteDriver = (name, options) => {
-    const openDriver = createBetterSqliteDriver(name, options);
+    const openDriver = createNodeJsSqliteDriver(name, options);
     return (run) => {
       const previousCwd = process.cwd();
       try {

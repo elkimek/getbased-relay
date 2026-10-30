@@ -4,6 +4,28 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 ## Unreleased
 
+### Changed
+
+- Pin `@evolu/common` 8.24.1 and `@evolu/nodejs` 4.4.3 together, adopting Evolu's SQLite 3.54.1 core, native timestamp storage, and prebuilt Node addon. Remove obsolete optional tooling peer overrides.
+- Retain the direct `better-sqlite3` dependency for getbased's operational helpers, owner proofs, metrics, and compaction.
+
+### Fixed
+
+- Serve each connection's requests in arrival order, yield between requests, pause reads while serving, and wait for each reply write before accepting more work. A slow quota callback no longer lets later requests overtake it, and a peer that stops reading cannot queue unlimited replies.
+- Keep paused connections alive during heartbeat checks; retain replay-filtered broadcasts, per-owner locks and broadcast backlog limits.
+- Log invalid protocol requests at debug level without raw frame bytes, and cancel queued request work when a connection closes.
+
+### Added
+
+- Public `GET` and `HEAD /health` on the WebSocket port, reporting database-schema readability; other HTTP requests receive 426. The private admin health endpoint retains its stronger required-table and replay-readiness checks.
+- Regression coverage for request ordering, reply backpressure, connection-close cancellation with a held reply, heartbeat progress, public health, and opening a synthetic 2.0.2 database while preserving keys, stored messages and compaction tombstones. Migrate compaction tests to `createNodeJsSqliteDriver`.
+
+### Upgrade notes
+
+- Back up the relay volume and retain the previous image before deployment. Rebuild with `npm ci` and `npm run build`, or rebuild the relay image. Preserve the database volume, owner keys, environment settings and existing HTTP/proxy routes; no database conversion or browser package update is required.
+- The native addon supports Linux (glibc >=2.28 or musl) and macOS >=13.5 on x64 and arm64; native Windows execution is no longer available.
+- Keep Node.js >=24.20.0; the Docker image remains pinned to Node.js 24.21.0. Native build tools are still needed for the retained operational SQLite dependency. Validate the new relay with current app clients before updating the browser packages.
+
 ## [2.0.2] - 2026-10-13
 
 ### Security

@@ -3,11 +3,12 @@
 // replay guard directly around the upstream SQLite storage. Protocol parsing,
 // reconciliation, encryption, persistence, and task lifetimes remain Evolu
 // implementations.
-// Adapter safeguards are aligned with @evolu/nodejs 4.1.0 in Evolu relay
-// 4.1.3 (4c01beb0): heartbeat activity, broadcast backlog, and shutdown guards.
+// Adapter safeguards follow @evolu/nodejs 4.4.3: heartbeat activity, broadcast
+// backlog, request fairness/backpressure, HTTP health, and shutdown guards.
 
 import {
   assert,
+  callback,
   createRelation,
   createSqlite,
   daemon,
@@ -18,7 +19,10 @@ import {
   type OwnerId,
   type Task,
   type TimeoutId,
+  sql,
   tryAsync,
+  trySync,
+  yieldNow,
   Uint8Array as EvoluUint8Array,
 } from "@evolu/common";
 import {
@@ -33,6 +37,7 @@ import {
   type ApplyProtocolMessageAsRelayOptions,
   type Relay,
   type RelayConfig,
+  type StorageDep,
 } from "@evolu/common/local-first";
 import type { RelayDeps } from "@evolu/nodejs";
 import { once } from "node:events";
@@ -95,6 +100,24 @@ export const createReplayProtectedRelay = ({
       relayConsole.log("Evolu Relay HTTP server disposed");
     });
 
+    // Match upstream's storage-readability probe. The private admin endpoint
+    // additionally checks our required tables and replay-protection readiness.
+    server.on("request", (request, response) => {
+      const path = request.url?.split("?")[0];
+      if (path === "/health" && (request.method === "GET" || request.method === "HEAD")) {
+        const check = trySync(() => {
+          if (isDisposing || relayRun.signal.aborted) throw new Error("Relay is stopping");
+          sqlite.exec(sql`select count(*) from sqlite_schema;`);
+        });
+        if (!check.ok) relayConsole.error("[relay]", "health check failed", { error: check.error });
+        response.writeHead(check.ok ? 200 : 503, { "content-type": "application/json" });
+        response.end(JSON.stringify({ status: check.ok ? "ok" : "error" }));
+        return;
+      }
+      response.writeHead(426, { connection: "Upgrade", upgrade: "websocket" });
+      response.end();
+    });
+
     const wss = disposer.adopt(
       new WebSocketServer({
         maxPayload: defaultProtocolMessageMaxSize,
@@ -110,11 +133,11 @@ export const createReplayProtectedRelay = ({
     );
     const ownerSocketRelation = createRelation<OwnerId, WebSocket>();
 
-    // Mirrors @evolu/nodejs 4.1.0: incoming data counts as activity, and
-    // buffered replies delay pinging so slow uploads/downloads stay connected.
+    // Paused connections cannot answer pings while their requests are served.
+    // Buffered replies and incoming data also keep slow paths alive.
     const pingClients = (): void => {
       for (const client of wss.clients) {
-        if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 0) continue;
+        if (client.readyState !== WebSocket.OPEN || client.bufferedAmount > 0 || client.isPaused) continue;
         if (!activeSockets.has(client)) {
           relayConsole.debug("[relay]", "unresponsive connection");
           client.terminate();
@@ -274,47 +297,74 @@ export const createReplayProtectedRelay = ({
         // owner lock; the protocol's unfiltered broadcast is deliberately off.
       };
 
+      // Serve one request at a time and yield between requests. Pausing reads
+      // keeps additional traffic in TCP; waiting for each send callback bounds
+      // replies for peers that stop reading. A read already being parsed can
+      // still deliver several messages, so keep those in arrival order.
+      const requests: Uint8Array[] = [];
+      let stopServing: (() => void) | undefined;
+      const serveRequests: Task<void, never, StorageDep> = async (processingRun) => {
+        try {
+          while (requests.length > 0) {
+            await processingRun.ok(yieldNow);
+            if (isDisposing || ws.readyState !== WebSocket.OPEN) break;
+            const request = requests.shift();
+            if (request === undefined) break;
+
+            await using messageRun = processingRun.create({
+              storage: replayGuard.withBroadcast((ownerId, messages) => {
+                const frame = createProtocolMessageBuffer(ownerId, {
+                  messageType: MessageType.Broadcast,
+                });
+                for (const accepted of messages) frame.addMessage(accepted);
+                broadcast(ownerId, frame.unwrap());
+              }),
+            });
+            const response = await messageRun.abortable(
+              applyProtocolMessageAsRelay(request, options),
+            );
+            if (!response.ok) {
+              if (response.error.type === "AbortError") break;
+              // Invalid peer traffic must not flood the default operational log.
+              relayConsole.debug("[relay]", "invalid protocol request", {
+                byteLength: request.length,
+                error: response.error.error,
+              });
+              continue;
+            }
+            if (isDisposing || ws.readyState !== WebSocket.OPEN) break;
+            await processingRun.ok(callback<void>(({ resolve }) => {
+              ws.send(response.value.message, { binary: true }, () => resolve(ok()));
+            }));
+            relayConsole.debug("[relay]", "responseLength", {
+              length: response.value.message.length,
+            });
+          }
+        } finally {
+          // Also resume during shutdown so the peer's close frame can be read.
+          ws.resume();
+        }
+        return ok();
+      };
+
       ws.on("message", (message) => {
         if (isDisposing || relayRun.signal.aborted || !EvoluUint8Array.is(message)) return;
-        relayConsole.debug("[relay]", "on message", {
-          length: message.length,
-        });
-
-        void (async () => {
-          await using messageRun = relayRun.create({
-            storage: replayGuard.withBroadcast((ownerId, messages) => {
-              const frame = createProtocolMessageBuffer(ownerId, {
-                messageType: MessageType.Broadcast,
-              });
-              for (const accepted of messages) frame.addMessage(accepted);
-              broadcast(ownerId, frame.unwrap());
-            }),
+        requests.push(message);
+        if (ws.isPaused) return;
+        ws.pause();
+        const serving = relayRun.abortable(serveRequests);
+        stopServing = () => serving.abort({ type: "WebSocketClosed" });
+        void serving.catch((error: unknown) => {
+          relayConsole.error("[relay]", "applyProtocolMessageAsRelayUnknownError", {
+            error: String(error),
           });
-          const response = await messageRun.abortable(
-            applyProtocolMessageAsRelay(message, options),
-          );
-          if (!response.ok) {
-            if (response.error.type === "AbortError") return;
-            relayConsole.error("[relay]", "applyProtocolMessageAsRelay", {
-              error: response.error,
-            });
-            return;
-          }
-          if (isDisposing || ws.readyState !== WebSocket.OPEN) return;
-          ws.send(response.value.message, { binary: true });
-          relayConsole.debug("[relay]", "responseLength", {
-            length: response.value.message.length,
-          });
-        })().catch((error: unknown) => {
-          relayConsole.error(
-            "[relay]",
-            "applyProtocolMessageAsRelayUnknownError",
-            { error: String(error) },
-          );
+          ws.terminate();
         });
       });
 
       ws.on("close", () => {
+        requests.length = 0;
+        stopServing?.();
         request.socket.removeListener("data", markActive);
         ownerSocketRelation.removeByB(ws);
         relayConsole.log("[relay]", "close", {
