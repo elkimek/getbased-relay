@@ -11,8 +11,9 @@ import { WebSocket } from "ws";
 import Database from "better-sqlite3";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
-  createProtocolMessageBuffer, createTimestampsBuffer, InfiniteUpperBound, MessageType, RangeType, SubscriptionFlags,
+  createProtocolMessageForSync, applyProtocolMessageAsClient, createProtocolMessageBuffer, createTimestampsBuffer, InfiniteUpperBound, MessageType, RangeType, SubscriptionFlags,
 } from "@evolu/common/local-first";
+import {memoryStorage} from "./helpers/replay-memory-storage.mjs";
 import { compactOwner } from "../dist/lib/compact-owner.js";
 
 import { createReplayProtectedRelay } from "../dist/lib/replay-protected-relay.js";
@@ -388,4 +389,45 @@ test("closing a connection cancels a held reply and discards queued writes befor
       } finally { hold = false; release?.(); }
     });
   } finally { hold = false; release?.(); sendMock.mock.restore(); }
+});
+
+
+for (const count of [2, 128]) test(`a stale peer with compacted history reaches protocol convergence (${count} messages)`, async () => {
+ await withRelay(async ({connect,run}) => {
+  const history=Array.from({length:count},(_,i)=>({timestamp:{millis:1000+i*100,counter:0,nodeId:"0011223344556677"},change:Buffer.alloc(count>2?16000:64,(i%250)+1)}));
+  const initial=await connect();
+  for(let offset=0;offset<history.length;offset+=40)await send(initial,request(history.slice(offset,offset+40)));
+  const db=new Database("evolu-relay.db");
+  try {
+   compactOwner(db,ownerBytes);
+   const rebuilt=Array.from({length:64},(_,i)=>({timestamp:{millis:200000+i*100,counter:0,nodeId:"0011223344556677"},change:Buffer.alloc(64,5)}));
+   await send(initial,request(rebuilt));
+   const reconcile=async initialMessages=>{
+    const client=memoryStorage(initialMessages);const clientRun=run.create({storage:client.storage});const socket=await connect();
+    try {
+     let outgoing=createProtocolMessageForSync({storage:client.storage})(ownerId);
+     for(let round=0;round<12;round++) {
+      const response=await send(socket,outgoing);const result=await clientRun.ok(applyProtocolMessageAsClient(response,{writeKey}));
+      if(result.type==="Converged") {
+       // A later full round on the same open connection must be a no-op.
+       // Otherwise every routine sync starts uploading discarded history again.
+       for(let repeat=0;repeat<3;repeat++) {
+        const next=createProtocolMessageForSync({storage:client.storage})(ownerId);
+        const settled=await clientRun.ok(applyProtocolMessageAsClient(await send(socket,next),{writeKey}));
+        assert.equal(settled.type,"Converged","a settled connection must not request compacted payloads again");
+       }
+       return {client,rounds:round+1};
+      }
+      assert.equal(result.type,"Response");outgoing=result.message;
+     }
+     assert.fail("compacted replay must converge instead of resending the same history");
+    } finally {socket.close();await clientRun[Symbol.asyncDispose]();}
+   };
+   const stale=await reconcile(history);
+   assert.equal(stale.client.values.size,count+64);assert(stale.rounds<12);
+   const fresh=await reconcile([]);assert.equal(fresh.client.values.size,64,"fresh restore gets only the rebuilt live history");
+   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM evolu_message").get().n,64);
+   assert.equal(db.prepare("SELECT storedBytes FROM evolu_usage").get().storedBytes,4096);
+  } finally {db.close();}
+ });
 });

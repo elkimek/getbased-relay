@@ -15,6 +15,7 @@ import {
   type OwnerIdBytes,
   type Storage,
 } from "@evolu/common/local-first";
+import {createReplaySessionStorage} from "./replay-session-storage.js";
 import type { Logger } from "./logger.js";
 import { withOwnerWriteLock } from "./owner-write-lock.js";
 
@@ -57,7 +58,12 @@ export function countCompactedTimestamps(
   return row?.count ?? 0;
 }
 
+export interface ReplaySession extends Disposable {
+  readonly storage: Storage;
+  readonly withBroadcast: (broadcast: (ownerId: OwnerId, messages: readonly EncryptedCrdtMessage[]) => void) => Storage;
+}
 export interface CompactionReplayGuard extends Disposable {
+  readonly createSession: () => ReplaySession;
   readonly storage: Storage;
   /** Broadcast only accepted writes while compaction still holds off. */
   readonly withBroadcast: (
@@ -83,54 +89,67 @@ export function createCompactionReplayGuard(
     WHERE "ownerId" = ?
   `);
 
-  function createGuardedStorage(
-    broadcast?: (ownerId: OwnerId, messages: readonly EncryptedCrdtMessage[]) => void,
-  ): Storage {
-    return {
-      ...storage,
-      writeMessages: (ownerIdBytes, messages) => async (run) => {
-        const ownerId = ownerIdBytesToOwnerId(ownerIdBytes);
-        return withOwnerWriteLock(ownerId, async () => {
-          const accepted: EncryptedCrdtMessage[] = [];
-          let rejectedBytes = 0;
-          for (const message of messages) {
-            const timestamp = timestampToTimestampBytes(message.timestamp);
-            if (wasCompacted.get(Buffer.from(ownerIdBytes), Buffer.from(timestamp))) {
-              rejectedBytes += message.change.length;
-            } else {
-              accepted.push(message);
+  const sessions = new Set<ReturnType<typeof createReplaySessionStorage>>();
+  function createSession(): ReplaySession {
+    const session = createReplaySessionStorage(storage);
+    sessions.add(session);
+    function createGuardedStorage(
+      broadcast?: (ownerId: OwnerId, messages: readonly EncryptedCrdtMessage[]) => void,
+    ): Storage {
+      return {
+        ...session.storage,
+        writeMessages: (ownerIdBytes, messages) => async (run) => {
+          const ownerId = ownerIdBytesToOwnerId(ownerIdBytes);
+          return withOwnerWriteLock(ownerId, async () => {
+            const accepted: EncryptedCrdtMessage[] = [];
+            let rejectedBytes = 0;
+            const acknowledged: ReturnType<typeof timestampToTimestampBytes>[] = [];
+            for (const message of messages) {
+              const timestamp = timestampToTimestampBytes(message.timestamp);
+              if (wasCompacted.get(Buffer.from(ownerIdBytes), Buffer.from(timestamp))) {
+                rejectedBytes += message.change.length;
+                acknowledged.push(timestamp);
+              } else {
+                accepted.push(message);
+              }
             }
-          }
 
-          const rejectedMessages = messages.length - accepted.length;
-          if (rejectedMessages > 0) {
-            logger.emit("info", "compaction.replay_filtered", {
-              ownerId,
-              rejectedMessages,
-              rejectedBytes,
-              acceptedMessages: accepted.length,
-            });
-          }
-          if (!isNonEmptyArray(accepted)) return ok();
-          const result = await run(storage.writeMessages(ownerIdBytes, accepted));
-          // The protocol normally broadcasts its original, unfiltered batch.
-          // Send the accepted batch here, after persistence and before releasing
-          // the same-owner lock, so compaction cannot slip between the two.
-          if (result.ok) broadcast?.(ownerId, accepted);
-          return result;
-        });
-      },
-      deleteOwner: (ownerIdBytes: OwnerIdBytes) => {
-        storage.deleteOwner(ownerIdBytes);
-        deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
-      },
-    };
+            const rejectedMessages = messages.length - accepted.length;
+            if (rejectedMessages > 0) {
+              logger.emit("info", "compaction.replay_filtered", {
+                ownerId,
+                rejectedMessages,
+                rejectedBytes,
+                acceptedMessages: accepted.length,
+              });
+            }
+            if (!isNonEmptyArray(accepted)) {session.acknowledge(ownerIdBytes, acknowledged); return ok();}
+            const result = await run(storage.writeMessages(ownerIdBytes, accepted));
+            // The protocol normally broadcasts its original, unfiltered batch.
+            // Send the accepted batch here, after persistence and before releasing
+            // the same-owner lock, so compaction cannot slip between the two.
+            if (result.ok) {session.acknowledge(ownerIdBytes, acknowledged); broadcast?.(ownerId, accepted);}
+            return result;
+          });
+        },
+        deleteOwner: (ownerIdBytes: OwnerIdBytes) => {
+          storage.deleteOwner(ownerIdBytes);
+          deleteOwnerReplayState.run(Buffer.from(ownerIdBytes));
+          for (const active of sessions) active.forgetOwner(ownerIdBytes);
+        },
+      };
+    }
+
+    return {storage: createGuardedStorage(), withBroadcast: createGuardedStorage,
+    [Symbol.dispose]() {session.dispose(); sessions.delete(session);}};
   }
-
+  const defaultSession = createSession();
   return {
-    storage: createGuardedStorage(),
-    withBroadcast: createGuardedStorage,
+    ...defaultSession,
+    createSession,
     [Symbol.dispose]() {
+      for (const session of sessions) session.dispose();
+      sessions.clear();
       db.close();
     },
   };

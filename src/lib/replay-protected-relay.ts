@@ -245,6 +245,7 @@ export const createReplayProtectedRelay = ({
     });
 
     wss.on("connection", (ws, request) => {
+      const replaySession = replayGuard.createSession();
       activeSockets.add(ws);
       const markActive = () => activeSockets.add(ws);
       request.socket.on("data", markActive);
@@ -312,7 +313,7 @@ export const createReplayProtectedRelay = ({
             if (request === undefined) break;
 
             await using messageRun = processingRun.create({
-              storage: replayGuard.withBroadcast((ownerId, messages) => {
+              storage: replaySession.withBroadcast((ownerId, messages) => {
                 const frame = createProtocolMessageBuffer(ownerId, {
                   messageType: MessageType.Broadcast,
                 });
@@ -363,6 +364,7 @@ export const createReplayProtectedRelay = ({
       });
 
       ws.on("close", () => {
+        replaySession[Symbol.dispose]();
         requests.length = 0;
         stopServing?.();
         request.socket.removeListener("data", markActive);
