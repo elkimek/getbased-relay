@@ -11,6 +11,8 @@ Notable changes to getbased-relay are documented here. The project follows Seman
 
 ### Fixed
 
+- A stale device with compacted history repeatedly uploaded discarded messages on later synchronization rounds. Reconciliation now acknowledges proven replay timestamps for that WebSocket connection only. Fresh devices still receive only live rebuilt history, and discarded payloads remain absent.
+- Release per-connection replay acknowledgements on disconnect and owner deletion.
 - Serve each connection's requests in arrival order, yield between requests, pause reads while serving, and wait for each reply write before accepting more work. A slow quota callback no longer lets later requests overtake it, and a peer that stops reading cannot queue unlimited replies.
 - Keep paused connections alive during heartbeat checks; retain replay-filtered broadcasts, per-owner locks and broadcast backlog limits.
 - Log invalid protocol requests at debug level without raw frame bytes, and cancel queued request work when a connection closes.
