@@ -9,7 +9,7 @@ export function memoryStorage(messages = []) {
  const base = {
   getSize: o=>times(o).length,
   fingerprint: (o,b,e)=>testFingerprintTimestamps(times(o).slice(b,e)),
-  fingerprintRanges: (o,buckets,upper=InfiniteUpperBound)=>{let b=0;return buckets.map(e=>{const out={type:RangeType.Fingerprint,upperBound:times(o)[e]??upper,fingerprint:base.fingerprint(o,b,e)};b=e;return out;});},
+  fingerprintRanges: (o,buckets,upper=InfiniteUpperBound)=>{let b=0;return buckets.map((e,i)=>{const out={type:RangeType.Fingerprint,upperBound:i===buckets.length-1?upper:times(o)[e]??upper,fingerprint:base.fingerprint(o,b,e)};b=e;return out;});},
   findLowerBound: (o,b,e,t)=>t===InfiniteUpperBound?e:Math.min(e,Math.max(b,times(o).findIndex(x=>Buffer.compare(x,t)>=0)===-1?times(o).length:times(o).findIndex(x=>Buffer.compare(x,t)>=0))),
   iterate:(o,b,e,cb)=>{const ts=times(o);for(let i=b;i<e;i++)if(!cb(ts[i],i))break;},
   validateWriteKey:()=>true,

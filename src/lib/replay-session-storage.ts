@@ -10,6 +10,8 @@ const index = (n: number) => NonNegativeInt.orThrow(n);
 interface Acknowledged {
   timestamps: TimestampBytes[];
   prefix: Uint8Array;
+  hashes: Fingerprint[];
+  seen: Set<string>;
 }
 export function createReplaySessionStorage(base: Storage) {
   const owners = new Map<string, Acknowledged>();
@@ -17,17 +19,42 @@ export function createReplaySessionStorage(base: Storage) {
   const key = (owner: OwnerIdBytes) => Buffer.from(owner).toString('hex');
   const acknowledge = (owner: OwnerIdBytes, timestamps: readonly TimestampBytes[]) => {
     if (disposed || !timestamps.length) return;
-    const previous = owners.get(key(owner));
-    const values = new Map((previous?.timestamps || []).map(t => [Buffer.from(t).toString('hex'), t]));
-    for (const t of timestamps) values.set(Buffer.from(t).toString('hex'), Uint8Array.from(t) as TimestampBytes);
-    if (values.size === previous?.timestamps.length) return;
-    const sorted = [...values.values()].sort(Buffer.compare);
-    const prefix = new Uint8Array((sorted.length + 1) * 12);
-    for (let n = 0; n < sorted.length; n++) {
-      const hash = timestampBytesToFingerprint(sorted[n]!);
-      for (let b = 0; b < 12; b++) prefix[(n + 1) * 12 + b] = prefix[n * 12 + b]! ^ hash[b]!;
+    const ownerKey = key(owner);
+    let ack = owners.get(ownerKey);
+    if (!ack) {ack = {timestamps: [], hashes: [], seen: new Set(), prefix: new Uint8Array(12)}; owners.set(ownerKey, ack);}
+    const fresh: {timestamp: TimestampBytes; hash: Fingerprint}[] = [];
+    for (const timestamp of timestamps) {
+      const hex = Buffer.from(timestamp).toString('hex');
+      if (ack.seen.has(hex)) continue;
+      const copy = Uint8Array.from(timestamp) as TimestampBytes;
+      fresh.push({timestamp: copy, hash: timestampBytesToFingerprint(copy)}); ack.seen.add(hex);
     }
-    owners.set(key(owner), {timestamps: sorted, prefix});
+    if (!fresh.length) return;
+    fresh.sort((a, b) => Buffer.compare(a.timestamp, b.timestamp));
+    let first = 0, high = ack.timestamps.length;
+    while (first < high) {const middle = Math.floor((first + high) / 2); if (Buffer.compare(ack.timestamps[middle]!, fresh[0]!.timestamp) < 0) first = middle + 1; else high = middle;}
+    if (first === ack.timestamps.length) {
+      for (const entry of fresh) {ack.timestamps.push(entry.timestamp); ack.hashes.push(entry.hash);}
+    } else {
+      const merged = ack.timestamps.slice(0, first), hashes = ack.hashes.slice(0, first);
+      let oldIndex = first, newIndex = 0;
+      while (oldIndex < ack.timestamps.length || newIndex < fresh.length) {
+        if (newIndex < fresh.length && (oldIndex === ack.timestamps.length || Buffer.compare(fresh[newIndex]!.timestamp, ack.timestamps[oldIndex]!) < 0)) {
+          merged.push(fresh[newIndex]!.timestamp); hashes.push(fresh[newIndex++]!.hash);
+        } else {merged.push(ack.timestamps[oldIndex]!); hashes.push(ack.hashes[oldIndex++]!);}
+      }
+      ack.timestamps = merged; ack.hashes = hashes;
+    }
+    const needed = (ack.timestamps.length + 1) * 12;
+    if (ack.prefix.length < needed) {
+      let capacity = ack.prefix.length; while (capacity < needed) capacity *= 2;
+      const prefix = new Uint8Array(capacity); prefix.set(ack.prefix); ack.prefix = prefix;
+    }
+    // Append-only batches touch only their new suffix. Out-of-order arrivals
+    // merge sorted new timestamps and reuse every already-computed hash.
+    for (let n = first; n < ack.timestamps.length; n++) {
+      for (let b = 0; b < 12; b++) ack.prefix[(n + 1) * 12 + b] = ack.prefix[n * 12 + b]! ^ ack.hashes[n]![b]!;
+    }
   };
   // Ack timestamps and live timestamps are disjoint: the guard only adds
   // timestamps proven compacted, which it never stores as live messages.
@@ -86,9 +113,9 @@ export function createReplaySessionStorage(base: Storage) {
     fingerprintRanges(owner, buckets, upperBound = InfiniteUpperBound) {
       if (!view(owner)) return base.fingerprintRanges(owner, buckets, upperBound);
       const size = storage.getSize(owner); let begin = index(0);
-      return buckets.map(end => {
+      return buckets.map((end, bucketIndex) => {
         let bound = upperBound;
-        if (end < size) storage.iterate(owner, end, index(end + 1), timestamp => {bound = timestamp; return false;});
+        if (bucketIndex < buckets.length - 1 && end < size) storage.iterate(owner, end, index(end + 1), timestamp => {bound = timestamp; return false;});
         const fingerprint = storage.fingerprint(owner, begin, end); begin = end;
         return {type: RangeType.Fingerprint, upperBound: bound, fingerprint};
       });

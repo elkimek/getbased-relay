@@ -21,7 +21,18 @@ for (const liveNumbers of [[],[2,4,6,8],[1,3,5,7],[1,2,7,8]]) test('virtual ackn
  for(let n=0;n<=10;n++)assert.equal(s.findLowerBound(owner,0,8,timestampToTimestampBytes(message(n).timestamp)),Math.max(0,Math.min(8,n-1)));
  assert.equal(s.findLowerBound(owner,0,8,InfiniteUpperBound),8);
  assert.deepEqual(s.fingerprintRanges(owner,[0,2,2,6,8]),[0,2,2,6,8].map((e,i,a)=>({type:RangeType.Fingerprint,upperBound:all[e]??InfiniteUpperBound,fingerprint:testFingerprintTimestamps(all.slice(a[i-1]??0,e))})));
+ const partialBound=timestampToTimestampBytes(message(6.5).timestamp);
+ assert.deepEqual(s.fingerprintRanges(owner,[2,4,6],partialBound),[2,4,6].map((e,i,a)=>({type:RangeType.Fingerprint,upperBound:i===2?partialBound:all[e],fingerprint:testFingerprintTimestamps(all.slice(a[i-1]??0,e))})));
  assert.equal(s.getSize(Buffer.alloc(16,2)),0);
  assert.equal(createReplaySessionStorage(base.storage).storage.getSize(owner),liveNumbers.length,'fresh peers must not inherit acknowledgements');
  assert.equal(base.values.size,liveNumbers.length,'no discarded payloads restored');
+});
+
+test('incremental, duplicate and out-of-order batches preserve all range fingerprints',()=>{
+ const base=memoryStorage([20,40,60].map(message));const session=createReplaySessionStorage(base.storage);
+ for(const batch of [[1,3,5],[7,9,11],[7,9,11],[2,4,6],[8,10,12]])session.acknowledge(owner,batch.map(n=>timestampToTimestampBytes(message(n).timestamp)));
+ const all=[1,2,3,4,5,6,7,8,9,10,11,12,20,40,60].map(n=>timestampToTimestampBytes(message(n).timestamp));
+ assert.equal(session.storage.getSize(owner),all.length);
+ for(let begin=0;begin<all.length;begin++)for(let end=begin;end<=all.length;end++)assert.deepEqual(session.storage.fingerprint(owner,begin,end),testFingerprintTimestamps(all.slice(begin,end)));
+ session.dispose();assert.equal(session.storage.getSize(owner),3);
 });
