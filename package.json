@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@evolu/common": "8.24.1",
-    "@evolu/nodejs": "4.4.3",
+    "@evolu/nodejs": "4.6.0",
     "better-sqlite3": "^13.0.3",
     "ws": "^8.22.0"
   },
