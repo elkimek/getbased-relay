@@ -1,4 +1,4 @@
-FROM node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+FROM node:24.22.2-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
